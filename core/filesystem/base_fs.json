@@ -1,0 +1,8 @@
+{
+  "/": ["home", "var", "etc"],
+  "/home": ["root"],
+  "/home/root": ["file1.txt", "notes.log"],
+  "/var": ["log"],
+  "/var/log": ["auth.log"],
+  "/etc": ["passwd", "shadow"]
+}

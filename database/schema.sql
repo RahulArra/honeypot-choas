@@ -69,15 +69,18 @@ CREATE TABLE IF NOT EXISTS chaos_results (
     FOREIGN KEY (threat_id) REFERENCES threats(threat_id)
 );
 
--- 5. ADAPTIVE_SCORES
--- One row per threat_type, updated after every experiment
+DROP TABLE IF EXISTS adaptive_scores; -- Remove the old global version
+
 CREATE TABLE IF NOT EXISTS adaptive_scores (
-    threat_type           TEXT PRIMARY KEY,
+    session_id            TEXT NOT NULL,
+    threat_type           TEXT NOT NULL,
     occurrence_count      INTEGER NOT NULL DEFAULT 0,
     current_severity      TEXT NOT NULL DEFAULT 'Low' CHECK (current_severity IN ('Low', 'Medium', 'High')),
     chaos_intensity_level INTEGER NOT NULL DEFAULT 1,     
     escalation_triggered  INTEGER NOT NULL DEFAULT 0 CHECK (escalation_triggered IN (0, 1)), 
-    last_updated          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    last_updated          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (session_id, threat_type), -- THE CRITICAL FIX
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id)
 );
 
 -- ============================================================
