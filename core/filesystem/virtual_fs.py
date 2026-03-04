@@ -21,9 +21,8 @@ class VirtualFileSystem:
         return self.cwd.replace("/home/root", "~")
 
     def list_dir(self):
-        entries = self.fs.get(self.cwd, [])
-        return "  ".join(entries)
-    
+        files = self.fs.get(self.cwd, [])
+        return "\n".join(files)
     def pwd(self):
         return self.cwd
 
