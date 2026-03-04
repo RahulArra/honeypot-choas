@@ -3,7 +3,7 @@ import socket
 import threading
 import paramiko
 import time
-
+import datetime
 from core.config import SSH_HOST, SSH_PORT, SESSION_TIMEOUT_SECONDS, MAX_COMMAND_LENGTH
 from core.ssh.session_manager import SessionManager
 from core.filesystem.virtual_fs import VirtualFileSystem
@@ -12,6 +12,8 @@ from core.parser.input_parser import normalize_input, sanitize_input
 from core.parser.command_classifier import classify_command
 from core.engine.rule_engine import RuleEngine
 from core.utils.logger import logger
+from core.intelligence.threat_service import handle_threat_detection
+from core.utils.latency import inject_latency
 
 KEY_FILE = "fake_ssh_rsa.key"
 
@@ -54,24 +56,44 @@ def handle_client(client_socket, address):
         session_id = session_manager.create_session(address[0])
         vfs = VirtualFileSystem()
         engine = RuleEngine(vfs)
-        logger.info(f"New connection from {address[0]}")
+        
+        logger.info(f"New session {session_id} started for {address[0]}")
+        
+        login_time = datetime.datetime.now().strftime("%a %b %d %H:%M:%S %Y")
+
+        channel.send(
+            f"Last login: {login_time} from {address[0]}\r\n"
+        )
+        channel.send("Ubuntu 22.04.4 LTS\r\n")
         channel.send(f"root@honeypot:{vfs.get_prompt_path()}$ ")
 
         buffer = ""
         last_activity = time.time()
 
         while True:
+            # 1. DEFENSIVE: Check if transport or channel died unexpectedly
+            if not transport.is_active():
+                logger.info(f"Transport dead for {address[0]}")
+                break
+            
+            if channel.closed or channel.exit_status_ready():
+                logger.info(f"Channel closed for {address[0]}")
+                break
+
+            # 2. Timeout Check
             if time.time() - last_activity > SESSION_TIMEOUT_SECONDS:
                 channel.send("\r\nSession timed out due to inactivity.\r\n")
                 session_manager.end_session(session_id, status="timeout")
                 break
 
+            # 3. Non-blocking Receive Check
             if not channel.recv_ready():
-                time.sleep(0.1)
+                time.sleep(0.05) # Small sleep to prevent CPU spiking
                 continue
 
             data = channel.recv(1024)
             if not data:
+                logger.info(f"EOF received from {address[0]}")
                 break
 
             last_activity = time.time()
@@ -84,48 +106,53 @@ def handle_client(client_socket, address):
                     channel.send("\r\n")
 
                     if command:
-                        try:
-                            # 1. BRAIN: Adaptive Throttling (The Tar Pit)
-                            # Slows down bots to observe patterns without crashing
+                       
+                       # 1. BRAIN: Throttling
+                        try :
                             delay = session_manager.get_throttle_delay(session_id)
                             if delay > 0:
                                 time.sleep(delay)
 
-                            # 2. PARSER: Sanitize & Normalize
-                            # Removes ANSI escape sequences (arrow keys) and standardizes input
+                            # 2. PARSER
                             clean_cmd = sanitize_input(command)
                             final_cmd = normalize_input(clean_cmd)
 
-                            # 3. INTELLIGENCE: Classification
-                            # Maps command to a category (e.g., 'Malware Attempt', 'System')
+                            # 3. DECEPTION ENGINE
+                            output = engine.execute(final_cmd)
+
+                            # 4. CLASSIFICATION (for logging category)
                             category = classify_command(final_cmd)
 
-                            # 4. DECEPTION: Execute via Rule Engine
-                            # Gets the fake response from your Virtual Filesystem
-                            output = engine.execute(final_cmd)
-                            
-                            # 5. DATABASE ALIGNMENT: Satisfy CHECK constraints
-                            # Member B's DB expects: 'rule', 'ai', or 'unknown'
-                            # Since this is your RuleEngine, we hardcode 'rule'
-                            response_type = 'rule' 
+                            # 5. LATENCY INJECTION
+                            inject_latency(category)
+
+                            # 6. DATABASE COMMAND INSERT
+                            response_type = "rule"
                             response_text = output if output else ""
 
-                            # 6. PERSISTENCE: Record the Interaction
                             session_manager.register_command(session_id)
-                            insert_command(
-                                session_id, 
-                                final_cmd, 
-                                category, 
-                                response_type, 
+
+                            command_id = insert_command(
+                                session_id,
+                                final_cmd,
+                                category,
+                                response_type,
                                 response_text
                             )
 
-                            # 7. INTERACTION: Send response back to Attacker
+                            # 7. THREAT INTELLIGENCE (CRITICAL STEP)
+                            threat_result = handle_threat_detection(
+                                session_id,
+                                command_id,
+                                final_cmd
+                            )
+
+                            # 8. INTERACTION
                             if output:
                                 channel.send(output + "\r\n")
 
                         except Exception as e:
-                            # Safeguard: Never crash the server, just report the error
+                            logger.error(f"Command Error: {str(e)}")
                             channel.send(f"Error processing command: {str(e)}\r\n")
 
                     channel.send(f"root@honeypot:{vfs.get_prompt_path()}$ ")
@@ -153,26 +180,26 @@ def handle_client(client_socket, address):
                         channel.send(f"root@honeypot:{vfs.get_prompt_path()}$ ")
 
     except Exception as e:
-        print(f"Connection error: {e}")
-        logger.error(f"Connection error: {e}")
+        logger.error(f"Session Error for {address[0]}: {e}")
     finally:
+        # CLEANUP: Ensure NO threads or sockets are leaked
         if session_manager and session_id:
             session_manager.end_session(session_id)
         if channel:
             channel.close()
-
-        logger.info(f"New connection from {address[0]}")
-        transport.close()
+        if transport:
+            transport.close()
+        logger.info(f"Cleanup finished for {address[0]}")
 
 def start_server():
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_socket.bind((SSH_HOST, SSH_PORT))
     server_socket.listen(100)
-    logger.info("SSH Honeypot running...")
+    logger.info(f"[*] SSH Honeypot (Hardened) running on {SSH_HOST}:{SSH_PORT}")
 
     while True:
         client, addr = server_socket.accept()
         thread = threading.Thread(target=handle_client, args=(client, addr))
-        thread.daemon = True
+        thread.daemon = True # Very important for clean exits
         thread.start()

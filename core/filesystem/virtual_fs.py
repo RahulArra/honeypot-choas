@@ -68,6 +68,9 @@ class VirtualFileSystem:
         return f"rm: cannot remove '{name}': No such file"
 
     def cat(self, name):
-        if name in self.fs[self.cwd]:
+        if name == "credentials.txt":
+            return "admin:password123"
+        elif name in self.fs[self.cwd]:
             return f"Simulated content of {name}"
+        
         return f"cat: {name}: No such file"

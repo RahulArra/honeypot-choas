@@ -14,6 +14,7 @@ class RuleEngine:
             "touch": self.handle_touch,
             "rm": self.handle_rm,
             "cat": self.handle_cat,
+            "whoami": self.handle_whoami
         }
 
     def execute(self, command):
@@ -72,3 +73,14 @@ class RuleEngine:
             return "cat: missing operand"
 
         return self.vfs.cat(args[0])
+    def handle_whoami(self, args):
+        return "root"
+    def handle_ps(self, args):
+
+        return (
+            "PID TTY          TIME CMD\n"
+            "1   ?        00:00:01 systemd\n"
+            "142 ?        00:00:00 sshd\n"
+            "201 pts/0    00:00:00 bash\n"
+            "244 pts/0    00:00:00 ps"
+        )
