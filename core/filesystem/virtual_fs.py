@@ -22,7 +22,8 @@ class VirtualFileSystem:
 
     def list_dir(self):
         files = self.fs.get(self.cwd, [])
-        return "\n".join(files)
+        # Using \r\n ensures the cursor returns to the start of the new line
+        return "\r\n".join(files)
     def pwd(self):
         return self.cwd
 

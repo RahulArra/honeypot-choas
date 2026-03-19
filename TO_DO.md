@@ -1,174 +1,148 @@
+2️⃣ Project Status Analysis
+Rahul (You)
+Completed
+| Component                  | Status |
+| -------------------------- | ------ |
+| SSH Server                 | ✔      |
+| Session Manager            | ✔      |
+| Virtual Filesystem         | ✔      |
+| Command Parser             | ✔      |
+| Rule Engine                | ✔      |
+| Unknown Command Handling   | ✔      |
+| Command Logging            | ✔      |
+| Threat Intelligence Engine | ✔      |
+| Adaptive Escalation Logic  | ✔      |
+| Edge Case Handling         | ✔      |
 
-# WEEK 1
-Create-Issue "Setup SQLite Database Schema" "Milestone: Week 1
+Completion:
 
-- Create sessions table
-- Create commands table
-- Create threats table
-- Create chaos_results table
-- Create adaptive_scores table
-- Test DB connection" "Seshmanuvarthi"
+~90–95% of your responsibilities
 
-Create-Issue "Implement SSH Server on Port 2222" "Milestone: Week 1
+Remaining (Your Side)
 
-- Setup Python SSH server
-- Bind to port 2222
-- Accept any password
-- Display prompt" "RahulArra"
+Small but important tasks remain.
 
-Create-Issue "Implement Session Manager" "Milestone: Week 1
+Task	                Priority
+Command rate limiting	Medium
+Integration test script	High
+AI fallback hook	    Medium
+Final system hardening	Medium
 
-- Generate session_id
-- Track start_time
-- Track end_time
-- Insert session into DB" "RahulArra"
 
-Create-Issue "Implement Virtual Filesystem Loader" "Milestone: Week 1
+Sesh (Teammate)
+Completed
+Component	Status
+SQLite schema	✔
+Database connection module	✔
+Insert helpers	✔
+Remaining
+Component	Status
+AI fallback integration	❌
+Chaos watcher	❌
+CPU stress simulation	❌
+Memory stress simulation	❌
+Disk I/O simulation	❌
+REST API	❌
+React dashboard	❌
+AWS deployment	❌
 
-- Create base filesystem JSON
-- Deep copy per session
-- Track current working directory" "RahulArra"
+Completion:
 
-Create-Issue "Implement Database Connection Module" "Milestone: Week 1
+~20–25%
 
-- Create DB connection helper
-- Implement insert methods
-- Test select queries" "Seshmanuvarthi"
+3️⃣ TODO List
+Rahul — Remaining Work
+1️⃣ Command Rate Limiting
 
-# WEEK 2
-Create-Issue "Implement Command Parser" "Milestone: Week 2
+Protect system from spam bots.
 
-- Normalize input
-- Extract command token
-- Handle empty input
-- Limit command length" "RahulArra"
+Example:
 
-Create-Issue "Implement Rule-Based Commands (ls, cd, pwd, etc.)" "Milestone: Week 2
+max_commands_per_second = 20
 
-- ls
-- cd
-- pwd
-- mkdir
-- touch
-- rm
-- cat
-- whoami
-- uname" "RahulArra"
+If exceeded → throttle.
 
-Create-Issue "Implement Unknown Command Handling" "Milestone: Week 2
+2️⃣ Integration Testing Script
 
-- Return bash-style error
-- Log command
-- Do NOT trigger AI" "RahulArra"
+Test full pipeline:
 
-Create-Issue "Implement Threat Keyword Mapping" "Milestone: Week 2
+SSH login
+↓
+execute malicious command
+↓
+verify threat logged
+↓
+verify adaptive escalation
+3️⃣ AI Fallback Hook
 
-- Define dangerous keywords
-- Map keyword to threat_type
-- Insert threat into DB" "RahulArra"
+Add placeholder for AI fallback:
 
-Create-Issue "Integrate AI Fallback for Unknown Commands" "Milestone: Week 2
+output = engine.execute(command)
 
-- Connect AI API
-- Retry once on failure
-- Validate JSON response" "Seshmanuvarthi"
+if output is None:
+    output = ai_generate(command)
 
-Create-Issue "Log All Commands to Database" "Milestone: Week 2
+Actual AI implementation will be Sesh's work.
 
-- Store command text
-- Store session_id
-- Store timestamp
-- Store source (rule/AI)" "RahulArra"
+4️⃣ Final Hardening
 
-# WEEK 3
-Create-Issue "Implement Chaos Watcher Background Process" "Milestone: Week 3
+Add:
 
-- Poll DB for unprocessed threats
-- Prevent blocking SSH
-- Mark threat processed" "Seshmanuvarthi"
+structured logging
 
-Create-Issue "Implement CPU Stress Simulation" "Milestone: Week 3
+graceful connection handling
 
-- Controlled CPU load
-- Timeout limit
-- Record CPU peak" "Seshmanuvarthi"
+thread cleanup
 
-Create-Issue "Implement Memory Stress Simulation" "Milestone: Week 3
+4️⃣ Sesh TODO List
+AI Integration
+Connect Gemini/OpenAI
+Retry on failure
+Validate JSON output
+Chaos Engine
 
-- Allocate memory safely
-- Record usage
-- Release memory" "Seshmanuvarthi"
+Implement:
 
-Create-Issue "Implement Disk I/O Simulation" "Milestone: Week 3
+CPU stress
+Memory stress
+Disk IO stress
 
-- Simulate disk writes
-- Measure duration
-- Clean up files" "Seshmanuvarthi"
+Triggered by:
 
-Create-Issue "Implement Occurrence Counter" "Milestone: Week 3
+SELECT * FROM threats WHERE processed = 0
+REST API
 
-- Count repeated threats
-- Update adaptive_scores table" "RahulArra"
+Endpoints:
 
-Create-Issue "Implement Severity Escalation Logic" "Milestone: Week 3
+/overview
+/sessions
+/threats
+/chaos
+/adaptive
+Dashboard
 
-- Escalate after 5 occurrences
-- Update severity
-- Log change" "RahulArra"
+React panels:
 
-Create-Issue "Implement Chaos Intensity Escalation" "Milestone: Week 3
+Executive overview
+Session explorer
+Threat panel
+Chaos results
+Adaptive evolution
+Deployment
 
-- Increase stress duration
-- Increase load level
-- Update adaptive table" "RahulArra"
+AWS EC2:
 
-# WEEK 4
-Create-Issue "Create REST API Base Setup" "Milestone: Week 4
+Ubuntu server
+Port 2222 open
+IP restricted
+Run backend
+5️⃣ Overall Project Completion
+Layer	Completion
+Deception Layer	95%
+Threat Intelligence Layer	95%
+Chaos Validation Layer	10%
+Dashboard Layer	0%
 
-- Setup Flask/FastAPI
-- Connect to SQLite
-- Test base route" "Seshmanuvarthi"
+Total project:
 
-Create-Issue "Implement Overview API Endpoint" "Milestone: Week 4
-
-- Total sessions
-- Total threats
-- Highest severity
-- Chaos executed count" "Seshmanuvarthi"
-
-Create-Issue "Implement Sessions API Endpoint" "Milestone: Week 4
-
-- Fetch session list
-- Fetch command history
-- Return structured JSON" "Seshmanuvarthi"
-
-Create-Issue "Build React Dashboard Layout" "Milestone: Week 4
-
-- Create pages
-- Add navigation
-- Apply dark theme" "Seshmanuvarthi"
-
-Create-Issue "Build Executive Overview Panel" "Milestone: Week 4
-
-- Metric cards
-- Charts" "Seshmanuvarthi"
-
-Create-Issue "Build Adaptive Learning Panel" "Milestone: Week 4
-
-- Show severity evolution
-- Show chaos intensity levels" "Seshmanuvarthi"
-
-Create-Issue "Implement Edge Case Handling" "Milestone: Week 4
-
-- Typos
-- Long input
-- Empty input
-- Special characters" "RahulArra"
-
-Create-Issue "Full System Integration Test" "Milestone: Week 4
-
-- SSH test
-- Threat logging test
-- Chaos trigger test
-- Adaptive escalation test
-- Dashboard validation" "RahulArra"
+~55% complete
