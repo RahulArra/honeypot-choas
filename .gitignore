@@ -15,4 +15,4 @@ database/*.db-shm
 
 # Environments
 venv/
-.venv/
+.venv/Commands.txt
