@@ -49,6 +49,15 @@ def insert_command(session_id, raw_input, parsed_command, response_type, respons
         return command_id
     finally:
         conn.close()
+        
+def update_command_response_type(command_id, response_type, response_text):
+    query = """
+        UPDATE commands 
+        SET response_type = ?, response_text = ?
+        WHERE command_id = ?
+    """
+    safe_execute(query, (response_type, response_text, command_id))
+
 
 def insert_threat(session_id, command_id, threat_type, severity, confidence, source):
     query = """
