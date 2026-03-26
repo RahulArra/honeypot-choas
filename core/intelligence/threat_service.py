@@ -27,6 +27,25 @@ logger = logging.getLogger(__name__)
 # Threat types that do NOT warrant a DB threat record or chaos trigger
 NON_THREAT_TYPES = {"Benign", "Unknown"}
 
+RULE_FAKE_RESPONSES = {
+    "wget":   "Connecting to {host}... HTTP request sent, awaiting response... 200 OK\nSaving to: '{file}'\n{file} 100%[=================================================>] 1.00K  --.-KB/s",
+    "curl":   "  % Total    % Received % Xferd  Average Speed\n100  1024  100  1024    0     0   2048      0 --:--:-- --:--:-- 0",
+    "sudo":   "[sudo] password for root:",
+    "chmod":  "",
+}
+
+def _fake_response_for_rule(raw_input: str) -> str:
+    cmd = raw_input.strip().split()[0].lower()
+    parts = raw_input.strip().split()
+    
+    if cmd == "wget" and len(parts) > 1:
+        url = parts[1]
+        filename = url.split("/")[-1] or "index.html"
+        host = url.split("/")[2] if len(url.split("/")) > 2 else "unknown"
+        template = RULE_FAKE_RESPONSES["wget"]
+        return template.format(host=host, file=filename)
+    
+    return RULE_FAKE_RESPONSES.get(cmd, f"bash: {cmd}: command not found")
 
 def handle_threat_detection(
     session_id: str,
@@ -73,9 +92,12 @@ def handle_threat_detection(
     }
 
     try:
-        # ── Step 1: Rule Engine (Rahul's code — untouched) ─────────────────────
         threat_data   = classify_command(raw_input)
         response_type = "rule" if threat_data else None
+
+        # Generate fake shell response for rule-matched threats
+        if threat_data is not None:
+            result["shell_response"] = _fake_response_for_rule(raw_input)
 
         # ── Step 2: AI Fallback (Sesh's code) ─────────────────────────────────
         if threat_data is None:

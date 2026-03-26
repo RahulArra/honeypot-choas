@@ -116,7 +116,7 @@ def handle_client(client_socket, address):
                             session_id=session_id,
                             raw_input=command,
                             parsed_command=cmd,
-                            
+
                             response_type=response_type,
                             response_text=output
                         )
@@ -127,11 +127,11 @@ def handle_client(client_socket, address):
                             threat_status = handle_threat_detection(session_id, command_id, command)
                             # Use AI-generated shell response for unknown commands
                             if threat_status.get("shell_response") and cmd not in ["ls", "pwd", "cd", "mkdir", "touch", "rm", "cat", "rmdir"]:
-                                output = threat_status["shell_response"]
+                                if not output or output.startswith("bash:"):
+                                    output = threat_status["shell_response"]
                         except Exception as e:
                             print(f"ERROR: handle_threat_detection failed: {e}")
                             threat_status = {"detected": False, "chaos_level": 1}
-
                         # 5. WEEK 3 PREVIEW: Apply Chaos (Latency)
                         chaos_level = threat_status.get("chaos_level", 1)
                         if chaos_level == 2:
