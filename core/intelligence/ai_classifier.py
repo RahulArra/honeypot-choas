@@ -46,19 +46,21 @@ VALID_SEVERITIES = {"Low", "Medium", "High"}
 
 # ── Prompt Builder ─────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are a cybersecurity threat analysis engine embedded in an SSH honeypot.
+SYSTEM_PROMPT = """You are a fake Linux shell running inside an SSH honeypot.
 
-Your job is to analyze Linux shell commands typed by attackers and return TWO things:
+Your job is to analyze commands and return TWO things:
 1. A threat classification
-2. A realistic fake Linux shell response to show the attacker
+2. A REALISTIC fake Linux shell response — as if the command actually ran on a real Ubuntu 20.04 server
 
-RULES:
-- You must respond ONLY with a valid JSON object. No explanation. No markdown. No preamble.
-- threat_type must be one of: Malware_Download, Privilege_Escalation, Integrity_Risk, CPU_Exhaustion, Reconnaissance, Data_Exfiltration, Persistence_Attempt, Lateral_Movement, Unknown, Benign
-- severity must be one of: Low, Medium, High
-- confidence must be a float between 0.0 and 1.0
-- shell_response must look like a realistic Linux terminal output (1-4 lines max)
-- For benign or unknown commands, make the shell_response look like a normal failed command
+CRITICAL RULES FOR shell_response:
+- NEVER return "command not found" — always simulate the command running
+- For network tools (ifconfig, netstat, ss): return realistic network interface/connection data
+- For system info (uname, uptime, id, whoami): return realistic system info
+- For help/man commands: return realistic help text excerpt
+- For file operations: return realistic file output
+- For reconnaissance tools (nmap, ping, traceroute): return realistic scan output
+- Make the output look like a real Ubuntu 20.04 server with normal services running
+- Keep responses to 3-6 lines maximum
 
 RESPONSE FORMAT (strict JSON, nothing else):
 {
@@ -66,7 +68,11 @@ RESPONSE FORMAT (strict JSON, nothing else):
   "severity": "...",
   "confidence": 0.0,
   "shell_response": "..."
-}"""
+}
+
+threat_type must be one of: Malware_Download, Privilege_Escalation, Integrity_Risk, CPU_Exhaustion, Reconnaissance, Data_Exfiltration, Persistence_Attempt, Lateral_Movement, Unknown, Benign
+severity must be one of: Low, Medium, High
+confidence must be a float between 0.0 and 1.0"""
 
 def _build_user_prompt(command: str, current_dir: str, session_fs: dict) -> str:
     """Build the user message with session context for better AI accuracy."""
@@ -104,12 +110,13 @@ def _call_grok(command: str, current_dir: str, session_fs: dict) -> Optional[dic
 
         raw_text = response.choices[0].message.content.strip()
         logger.debug(f"[AI] Raw response for '{command}': {raw_text}")
-
-        parsed = json.loads(raw_text)
+        raw_text = raw_text.replace("```json", "").replace("```", "").strip()
+        parsed = json.loads(raw_text, strict=False)
         return parsed
 
     except json.JSONDecodeError as e:
         logger.warning(f"[AI] JSON parse failed for '{command}': {e}")
+        logger.warning(f"[AI] Raw text was: {repr(raw_text[:300])}")
         return None
     except Exception as e:
         logger.warning(f"[AI] API call failed for '{command}': {e}")
