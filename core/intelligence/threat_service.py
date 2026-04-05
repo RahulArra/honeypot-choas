@@ -119,7 +119,12 @@ def handle_threat_detection(
     if session_fs is None:
         session_fs = {}
 
-    cmd_token = raw_input.strip().split()[0].lower() if raw_input.strip() else ""
+    # Normalize the key — strip whitespace + lowercase to avoid cache misses like '  whoami'
+    cmd_token = raw_input.strip().lower().split()[0] if raw_input.strip() else ""
+
+    # Early exit: ignore blank lines, shell comments, pure whitespace
+    if not cmd_token or raw_input.strip().startswith("#"):
+        return result
 
     # ── Safe defaults ──────────────────────────────────────────────────────────
     result = {
