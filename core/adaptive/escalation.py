@@ -28,17 +28,17 @@ def update_adaptive_score(session_id, threat_type):
         escalation_triggered = 1
         if severity == "Low":
             severity = "Medium"
-            intensity = 2
+            intensity = min(intensity + 1, 3)
         elif severity == "Medium":
             severity = "High"
-            intensity = 3
+            intensity = min(intensity + 1, 3)
         # If already High, intensity stays at 3 but count continues to rise
 
     # 3. UPSERT into the database
     cursor.execute("""
         INSERT INTO adaptive_scores 
-        (session_id, threat_type, occurrence_count, current_severity, chaos_intensity_level, escalation_triggered)
-        VALUES (?, ?, ?, ?, ?, ?)
+        (session_id, threat_type, occurrence_count, current_severity, chaos_intensity_level, escalation_triggered, is_weakness)
+        VALUES (?, ?, ?, ?, ?, ?, 0)
         ON CONFLICT(session_id, threat_type) DO UPDATE SET
             occurrence_count = excluded.occurrence_count,
             current_severity = excluded.current_severity,
@@ -50,3 +50,41 @@ def update_adaptive_score(session_id, threat_type):
     conn.commit()
     conn.close()
     return severity, intensity
+
+def mark_weakness(session_id, threat_type):
+    """Mark a specific threat as a known weakness for this session."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE adaptive_scores 
+        SET is_weakness = 1, last_updated = CURRENT_TIMESTAMP
+        WHERE session_id = ? AND threat_type = ?
+    """, (session_id, threat_type))
+    conn.commit()
+    conn.close()
+
+def increase_intensity(session_id, threat_type):
+    """Forcefully increase the intensity of the given threat (max 3)."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE adaptive_scores 
+        SET chaos_intensity_level = MIN(chaos_intensity_level + 1, 3), 
+            last_updated = CURRENT_TIMESTAMP
+        WHERE session_id = ? AND threat_type = ?
+    """, (session_id, threat_type))
+    conn.commit()
+    conn.close()
+
+def simulate_scaling(session_id, threat_type):
+    """Simulate scaling by artificially capping intensity to act as 'Better Config'."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE adaptive_scores 
+        SET chaos_intensity_level = MAX(chaos_intensity_level - 1, 1), 
+            last_updated = CURRENT_TIMESTAMP
+        WHERE session_id = ? AND threat_type = ?
+    """, (session_id, threat_type))
+    conn.commit()
+    conn.close()

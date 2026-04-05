@@ -67,12 +67,20 @@ RESPONSE FORMAT (strict JSON, nothing else):
   "threat_type": "...",
   "severity": "...",
   "confidence": 0.0,
-  "shell_response": "..."
+  "shell_response": "...",
+  "experiment": {
+    "type": "cpu_stress",
+    "intensity": 1,
+    "duration": 10
+  }
 }
 
 threat_type must be one of: Malware_Download, Privilege_Escalation, Integrity_Risk, CPU_Exhaustion, Reconnaissance, Data_Exfiltration, Persistence_Attempt, Lateral_Movement, Unknown, Benign
 severity must be one of: Low, Medium, High
-confidence must be a float between 0.0 and 1.0"""
+confidence must be a float between 0.0 and 1.0
+experiment.type must be one of: cpu_stress, memory_stress, disk_io
+experiment.intensity must be an integer between 1 and 3
+experiment.duration must be an integer between 5 and 20"""
 
 def _build_user_prompt(command: str, current_dir: str, session_fs: dict) -> str:
     """Build the user message with session context for better AI accuracy."""
@@ -158,11 +166,20 @@ def _validate_and_clean(parsed: dict) -> Optional[dict]:
     if not isinstance(shell_response, str) or not shell_response.strip():
         shell_response = "bash: command not found"
 
+    # Sanitize experiment
+    experiment_raw = parsed.get("experiment", {})
+    experiment = {
+        "type": experiment_raw.get("type", "cpu_stress") if experiment_raw.get("type") in ["cpu_stress", "memory_stress", "disk_io"] else "cpu_stress",
+        "intensity": min(max(int(experiment_raw.get("intensity", 1)), 1), 3),
+        "duration": min(max(int(experiment_raw.get("duration", 10)), 5), 20),
+    }
+
     return {
         "threat_type":    threat_type,
         "severity":       severity,
         "confidence":     confidence,
         "shell_response": shell_response,
+        "experiment":     experiment,
         "source":         "ai",         # Marks this as AI-classified for DB
     }
 
@@ -174,6 +191,7 @@ _FALLBACK_RESULT = {
     "severity":       "Low",
     "confidence":     0.0,
     "shell_response": "bash: command not found",
+    "experiment":     {"type": "cpu_stress", "intensity": 1, "duration": 5},
     "source":         "ai",
 }
 
@@ -262,3 +280,7 @@ def classify_with_ai(
 #           insert_threat(session_id, command_id, result["type"],
 #                         result["severity"], result["confidence"], source)
 #           update_adaptive_score(session_id, result["type"], result["severity"])
+
+
+
+

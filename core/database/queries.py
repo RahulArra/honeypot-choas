@@ -59,17 +59,25 @@ def update_command_response_type(command_id, response_type, response_text):
     safe_execute(query, (response_type, response_text, command_id))
 
 
-def insert_threat(session_id, command_id, threat_type, severity, confidence, source):
+def insert_threat(session_id, command_id, threat_type, severity, confidence, source, experiment=None):
+    if experiment is None:
+        experiment = {"type": "cpu_stress", "intensity": 1, "duration": 10}
+        
     query = """
         INSERT INTO threats
-        (session_id, command_id, threat_type, severity, confidence, source)
-        VALUES (?, ?, ?, ?, ?, ?)
+        (session_id, command_id, threat_type, severity, confidence, source, experiment_type, experiment_intensity, experiment_duration)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
 
     conn = get_connection()
     cursor = conn.cursor()
 
-    cursor.execute(query, (session_id, command_id, threat_type, severity, confidence, source))
+    cursor.execute(query, (
+        session_id, command_id, threat_type, severity, confidence, source,
+        experiment.get("type", "cpu_stress"),
+        experiment.get("intensity", 1),
+        experiment.get("duration", 10)
+    ))
 
     conn.commit()
     conn.close()

@@ -30,3 +30,14 @@ def get_experiment_type(threat_type: str) -> str:
 
 def get_duration(intensity_level: int) -> int:
     return INTENSITY_DURATION.get(intensity_level, 5)
+
+def get_rule_based_experiment(threat_type: str, severity: str) -> dict:
+    """Generate a test config dynamically from the rule."""
+    intensity_map = {"Low": 1, "Medium": 2, "High": 3}
+    intensity = intensity_map.get(severity, 1)
+    
+    return {
+        "type": get_experiment_type(threat_type),
+        "intensity": intensity,
+        "duration": get_duration(intensity)
+    }

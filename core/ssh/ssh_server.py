@@ -141,7 +141,10 @@ def handle_client(client_socket, address):
 
                         # 6. Send Output
                         if output:
-                            channel.send(output + "\r\n")
+                            formatted_output = output.replace("\r\n", "\n").replace("\n", "\r\n")
+                            if not formatted_output.endswith("\r\n"):
+                                formatted_output += "\r\n"
+                            channel.send(formatted_output)
 
                     channel.send(f"root@honeypot:{vfs.get_prompt_path()}$ ")
                 elif char in ("\x7f", "\x08"):

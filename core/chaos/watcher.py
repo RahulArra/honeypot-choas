@@ -19,7 +19,7 @@ from datetime import datetime
 from core.chaos.experiments import run_experiment
 from core.chaos.threat_map  import get_experiment_type, get_duration
 from core.database.db_client import safe_execute, get_connection
-from core.adaptive.escalation import update_adaptive_score
+from core.adaptive.escalation import update_adaptive_score, mark_weakness, increase_intensity, simulate_scaling
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +31,7 @@ POLL_INTERVAL = 5   # seconds between DB polls
 def _fetch_unprocessed_threats():
     """Fetch all unprocessed threats ordered by timestamp."""
     rows = safe_execute(
-        "SELECT threat_id, session_id, threat_type, severity FROM threats WHERE processed = 0 ORDER BY timestamp ASC",
+        "SELECT threat_id, session_id, threat_type, severity, experiment_type, experiment_intensity, experiment_duration FROM threats WHERE processed = 0 ORDER BY timestamp ASC",
         fetch=True
     )
     return rows or []
@@ -49,7 +49,7 @@ def _get_chaos_intensity(session_id: str, threat_type: str) -> int:
     return 1  # Default intensity
 
 
-def _insert_chaos_result(threat_id: int, metrics: dict):
+def _insert_chaos_result(threat_id: int, metrics: dict, is_retest: int = 0):
     """Insert experiment metrics into chaos_results table."""
     conn = get_connection()
     try:
@@ -60,8 +60,8 @@ def _insert_chaos_result(threat_id: int, metrics: dict):
                 threat_id, experiment_type, intensity_level,
                 cpu_peak, memory_peak, disk_io_peak,
                 duration_secs, recovery_time_secs, result,
-                started_at, completed_at, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                started_at, completed_at, notes, is_retest
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 threat_id,
@@ -76,6 +76,7 @@ def _insert_chaos_result(threat_id: int, metrics: dict):
                 datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
                 datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
                 metrics.get("notes", ""),
+                is_retest,
             )
         )
         conn.commit()
@@ -113,6 +114,9 @@ def _watcher_loop():
                 session_id  = row[1]
                 threat_type = row[2]
                 severity    = row[3]
+                exp_type    = row[4]
+                exp_intensity = row[5]
+                exp_duration  = row[6]
 
                 logger.info(
                     f"[Chaos] Processing threat_id={threat_id} "
@@ -120,36 +124,40 @@ def _watcher_loop():
                 )
 
                 try:
-                    # ── Step 1: Map threat → experiment ────────────────────────
-                    experiment_type = get_experiment_type(threat_type)
-                    intensity_level = _get_chaos_intensity(session_id, threat_type)
-                    duration        = get_duration(intensity_level)
-
+                    # ── Step 1: Run Primary Experiment ────────────────────────
                     logger.info(
-                        f"[Chaos] Running {experiment_type} "
-                        f"intensity={intensity_level} duration={duration}s"
+                        f"[Chaos] Running Primary Test {exp_type} "
+                        f"intensity={exp_intensity} duration={exp_duration}s"
                     )
 
-                    # ── Step 2: Run experiment ─────────────────────────────────
-                    metrics = run_experiment(experiment_type, duration, intensity_level)
-                    metrics["intensity_level"] = intensity_level
-
-                    # ── Step 3: Store metrics ──────────────────────────────────
-                    _insert_chaos_result(threat_id, metrics)
-
-                    # ── Step 4: Update adaptive score ──────────────────────────
+                    metrics = run_experiment(exp_type, exp_duration, exp_intensity)
+                    _insert_chaos_result(threat_id, metrics, is_retest=0)
                     update_adaptive_score(session_id, threat_type)
 
-                    # ── Step 5: Mark processed ─────────────────────────────────
-                    _mark_threat_processed(threat_id)
+                    logger.info(f"[Chaos] ✓ Primary Result: {metrics['result']}")
 
-                    logger.info(
-                        f"[Chaos] ✓ threat_id={threat_id} → "
-                        f"{metrics['result']} "
-                        f"(cpu={metrics['cpu_peak']}%, "
-                        f"mem={metrics['memory_peak']}%, "
-                        f"recovery={metrics['recovery_time_secs']}s)"
-                    )
+                    # ── Step 2: Adaptive Engine (NEW) ──────────────────────────
+                    if metrics["result"] == "Vulnerable":
+                        logger.warning(f"[Chaos] 🚨 System Vulnerable! Activating Adaptive Engine.")
+                        mark_weakness(session_id, threat_type)
+                        increase_intensity(session_id, threat_type)
+                        simulate_scaling(session_id, threat_type) # Simulate stronger system for re-test
+
+                        # Fetch improved configuration
+                        new_intensity = _get_chaos_intensity(session_id, threat_type)
+                        logger.info(f"[Chaos] Re-testing with simulated scaling (intensity {new_intensity})")
+                        
+                        # ── Step 3: Re-Test ──────────────────────────────────────
+                        retest_metrics = run_experiment(exp_type, exp_duration, new_intensity)
+                        _insert_chaos_result(threat_id, retest_metrics, is_retest=1)
+
+                        if retest_metrics["result"] == "Resilient":
+                            logger.info("[Chaos] 🛡️ Re-test Resilient! System successfully demonstrated adaptation.")
+                        else:
+                            logger.warning("[Chaos] 🚨 Re-test Vulnerable. Weakness persists.")
+
+                    # ── Step 4: Mark processed ─────────────────────────────────
+                    _mark_threat_processed(threat_id)
 
                 except Exception as e:
                     logger.error(

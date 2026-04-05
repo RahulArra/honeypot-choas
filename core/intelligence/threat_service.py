@@ -52,7 +52,7 @@ def _load_ai_cache_from_db() -> dict:
     try:
         rows = safe_execute(
             """
-            SELECT c.parsed_command, c.response_text, t.threat_type, t.severity, t.confidence
+            SELECT c.parsed_command, c.response_text, t.threat_type, t.severity, t.confidence, t.experiment_type, t.experiment_intensity, t.experiment_duration
             FROM commands c
             LEFT JOIN threats t ON c.command_id = t.command_id
             WHERE c.response_type = 'ai'
@@ -70,6 +70,7 @@ def _load_ai_cache_from_db() -> dict:
                         "threat_type":    row[2] or "Unknown",
                         "severity":       row[3] or "Low",
                         "confidence":     float(row[4]) if row[4] else 0.0,
+                        "experiment":     {"type": row[5] or "cpu_stress", "intensity": row[6] or 1, "duration": row[7] or 10}
                     }
             logger.info(f"[ThreatService] Loaded {len(cache)} AI-learned commands from DB")
         else:
@@ -158,6 +159,7 @@ def handle_threat_detection(
                         "type":       cached["threat_type"],
                         "severity":   cached["severity"],
                         "confidence": cached["confidence"],
+                        "experiment": cached["experiment"]
                     }
                     response_type = "ai"
                 else:
@@ -186,6 +188,7 @@ def handle_threat_detection(
                     "threat_type":    ai_result["threat_type"],
                     "severity":       ai_result["severity"],
                     "confidence":     ai_result["confidence"],
+                    "experiment":     ai_result.get("experiment")
                 }
                 logger.info(f"[ThreatService] Cached '{cmd_token}' for future use")
 
@@ -194,6 +197,7 @@ def handle_threat_detection(
                         "type":       ai_result["threat_type"],
                         "severity":   ai_result["severity"],
                         "confidence": ai_result["confidence"],
+                        "experiment": ai_result.get("experiment")
                     }
                     logger.info(
                         f"[ThreatService] AI classified '{raw_input}' → "
@@ -214,6 +218,7 @@ def handle_threat_detection(
                 severity=threat_data["severity"],
                 confidence=threat_data["confidence"],
                 source=response_type,
+                experiment=threat_data.get("experiment")
             )
             logger.info(
                 f"[ThreatService] Threat inserted → {threat_data['type']} "

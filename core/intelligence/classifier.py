@@ -32,6 +32,8 @@ THREAT_RULES = [
     }
 ]
 
+from core.chaos.threat_map import get_rule_based_experiment
+
 def classify_command(raw_input):
     """
     Pure Logic: Only analyzes text. 
@@ -44,7 +46,8 @@ def classify_command(raw_input):
             return {
                 "type": rule["type"],
                 "severity": rule["severity"],
-                "confidence": rule["confidence"]
+                "confidence": rule["confidence"],
+                "experiment": get_rule_based_experiment(rule["type"], rule["severity"])
             }
             
     return None
