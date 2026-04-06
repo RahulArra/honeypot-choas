@@ -1,8 +1,17 @@
 
 -- ============================================================
 -- Adaptive Deception-Driven Cyber Resilience Validation System
--- Refined SQLite Schema — V2 (Production Ready)
+-- Refined SQLite Schema — V3 (High-Impact Improvements)
 -- ============================================================
+
+-- 0. CONFIGURATION
+PRAGMA journal_mode=WAL;
+PRAGMA synchronous=NORMAL;
+
+-- Clean start for adaptive components to ensure new columns exist
+DROP VIEW IF EXISTS v_vulnerability_metrics;
+DROP TABLE IF EXISTS global_threat_stats;
+DROP TABLE IF EXISTS adaptive_scores;
 
 -- 1. SESSIONS
 CREATE TABLE IF NOT EXISTS sessions (
@@ -65,8 +74,7 @@ CREATE TABLE IF NOT EXISTS chaos_results (
     FOREIGN KEY (threat_id) REFERENCES threats(threat_id)
 );
 
-DROP TABLE IF EXISTS adaptive_scores;
-
+-- 5. ADAPTIVE_SCORES (Refined)
 CREATE TABLE IF NOT EXISTS adaptive_scores (
     session_id            TEXT NOT NULL,
     threat_type           TEXT NOT NULL,
@@ -75,13 +83,54 @@ CREATE TABLE IF NOT EXISTS adaptive_scores (
     chaos_intensity_level INTEGER NOT NULL DEFAULT 1,     
     escalation_triggered  INTEGER NOT NULL DEFAULT 0 CHECK (escalation_triggered IN (0, 1)),
     is_weakness           INTEGER NOT NULL DEFAULT 0 CHECK (is_weakness IN (0, 1)),
+    
+    -- New Fields for Realism & Metrics
+    total_runs            INTEGER NOT NULL DEFAULT 0,
+    total_failures        INTEGER NOT NULL DEFAULT 0,
+    is_scaled             INTEGER NOT NULL DEFAULT 0 CHECK (is_scaled IN (0, 1)),
+    scaled_until          DATETIME,
+    last_scaled_at        DATETIME,
+    predicted_risk_score  REAL NOT NULL DEFAULT 0.0,
+    
     last_updated          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (session_id, threat_type),
     FOREIGN KEY (session_id) REFERENCES sessions(session_id)
 );
 
+-- 6. GLOBAL_THREAT_STATS (Cross-Session Intelligence)
+CREATE TABLE IF NOT EXISTS global_threat_stats (
+    threat_type           TEXT PRIMARY KEY,
+    total_runs            INTEGER NOT NULL DEFAULT 0,
+    total_failures        INTEGER NOT NULL DEFAULT 0,
+    avg_intensity         REAL NOT NULL DEFAULT 1.0,
+    last_seen             DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 7. ANALYTICS VIEW (Dynamic Metrics Calculation)
+CREATE VIEW v_vulnerability_metrics AS
+SELECT 
+    threat_type,
+    total_runs,
+    total_failures,
+    CASE 
+        WHEN total_runs < 5 THEN total_failures * 1.0 / 5
+        ELSE total_failures * 1.0 / total_runs
+    END AS failure_rate,
+    ( 
+        (
+            CASE 
+                WHEN total_runs < 5 THEN total_failures * 1.0 / 5
+                ELSE total_failures * 1.0 / MAX(total_runs, 1)
+            END
+        ) * 0.7 +
+        (MIN(avg_intensity, 3.0) / 3.0) * 0.3 
+    ) AS risk_score
+FROM global_threat_stats;
+
+-- 8. INDEXES (Performance Optimization)
 CREATE INDEX IF NOT EXISTS idx_commands_session   ON commands(session_id);
 CREATE INDEX IF NOT EXISTS idx_threats_session    ON threats(session_id);
 CREATE INDEX IF NOT EXISTS idx_threats_processed  ON threats(processed);
-CREATE INDEX IF NOT EXISTS idx_threats_type       ON threats(threat_type);
 CREATE INDEX IF NOT EXISTS idx_chaos_threat       ON chaos_results(threat_id);
+CREATE INDEX IF NOT EXISTS idx_threat_last_seen   ON global_threat_stats(last_seen);
+CREATE INDEX IF NOT EXISTS idx_adaptive_scaled    ON adaptive_scores(is_scaled);

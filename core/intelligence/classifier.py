@@ -1,28 +1,43 @@
-from core.database.queries import insert_threat
-from core.adaptive.escalation import update_adaptive_score
+from core.chaos.threat_map import get_rule_based_experiment
 
-# Refined Rule Engine: Pattern-based matching with confidence scores
+def normalize_command(raw_input):
+    return " ".join((raw_input or "").strip().lower().split())
+
+
+def _split_chained_commands(raw_input):
+    normalized = normalize_command(raw_input)
+    if not normalized or normalized.startswith("#"):
+        return []
+    return [segment.strip() for segment in normalized.split("&&") if segment.strip()]
+
+
+def _starts_with_token(command, token):
+    return command == token or command.startswith(f"{token} ")
+
+
 THREAT_RULES = [
     {
         "id": "malware_wget",
         "type": "Malware_Download",
         "severity": "High",
         "confidence": 0.95,
-        "check": lambda c: c.startswith("wget ")
+        "check": lambda c: _starts_with_token(c, "wget")
     },
     {
         "id": "malware_curl",
         "type": "Malware_Download",
         "severity": "High",
         "confidence": 0.90,
-        "check": lambda c: c.startswith("curl ")
+        "check": lambda c: _starts_with_token(c, "curl")
     },
     {
         "id": "priv_esc_sudo",
         "type": "Privilege_Escalation",
         "severity": "Medium",
         "confidence": 1.0,
-        "check": lambda c: c in ("sudo su", "sudo -i", "sudo bash", "sudo sh")
+        "check": lambda c: any(
+            phrase in c for phrase in ("sudo su", "sudo -i", "sudo bash", "sudo sh", "sudo -s")
+        )
     },
     {
         "id": "integrity_chmod",
@@ -74,8 +89,8 @@ THREAT_RULES = [
         "severity": "Medium",
         "confidence": 0.85,
         "check": lambda c: (
-            c.startswith("nmap") or
-            c.startswith("masscan") or
+            _starts_with_token(c, "nmap") or
+            _starts_with_token(c, "masscan") or
             c in ("arp -a", "netstat", "ss -tulpn") or
             "netstat" in c
         )
@@ -89,27 +104,26 @@ THREAT_RULES = [
     },
 ]
 
-from core.chaos.threat_map import get_rule_based_experiment
-
 def classify_command(raw_input):
     """
     Pure Logic: Only analyzes text.
     Returns a dictionary of threat details if matched, else None.
     Ignores blank lines, comments, and pure whitespace.
     """
-    clean_cmd = raw_input.strip().lower()
-
-    # Ignore blank lines, shell comments, pure whitespace
-    if not clean_cmd or clean_cmd.startswith("#"):
+    commands = _split_chained_commands(raw_input)
+    if not commands:
         return None
 
-    for rule in THREAT_RULES:
-        if rule["check"](clean_cmd):
-            return {
-                "type": rule["type"],
-                "severity": rule["severity"],
-                "confidence": rule["confidence"],
-                "experiment": get_rule_based_experiment(rule["type"], rule["severity"])
-            }
+    for command in commands:
+        for rule in THREAT_RULES:
+            if rule["check"](command):
+                return {
+                    "type": rule["type"],
+                    "severity": rule["severity"],
+                    "confidence": max(0.0, min(float(rule["confidence"]), 1.0)),
+                    "rule_id": rule["id"],
+                    "command": command,
+                    "experiment": get_rule_based_experiment(rule["type"], rule["severity"]),
+                }
 
     return None

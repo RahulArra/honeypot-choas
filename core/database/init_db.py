@@ -9,6 +9,9 @@ def init_db():
         schema = f.read()
     
     conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA foreign_keys = ON;")
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
     conn.executescript(schema)
     conn.commit()
     conn.close()

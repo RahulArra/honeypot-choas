@@ -1,190 +1,215 @@
 """
 Chaos Watcher — Chaos Validation Engine
-Member B (Sesh) Responsibility
 
-Background daemon thread that:
-    1. Polls threats table every 5 seconds for processed=0
-    2. Maps threat_type → experiment_type
-    3. Runs controlled stress experiment
-    4. Stores metrics in chaos_results
-    5. Updates adaptive_scores
-    6. Marks threat as processed=1
+Orchestrates experiment discovery, execution, adaptive updates, and
+cross-session learning with structured JSON logs.
 """
 
-import time
-import threading
+import json
 import logging
-from datetime import datetime
+import threading
+import time
+from datetime import datetime, timezone
 
-from core.chaos.experiments import run_experiment
-from core.chaos.threat_map  import get_experiment_type, get_duration
-from core.database.db_client import safe_execute, get_connection
-from core.adaptive.escalation import update_adaptive_score, mark_weakness, increase_intensity, simulate_scaling
+from core.adaptive.escalation import (
+    check_and_reset_scaling,
+    get_adaptive_state,
+    mark_weakness,
+    simulate_scaling,
+    update_prediction_metrics,
+    update_session_metrics,
+)
+from core.chaos.experiments import run_experiment, validate_experiment_config
+from core.chaos.threat_map import get_rule_based_experiment
+from core.database.db_client import get_connection, safe_execute
+from core.database.queries import get_threat_prediction, upsert_global_threat_stats
+from core.intelligence.ai_classifier import generate_experiment_with_ai
 
 logger = logging.getLogger(__name__)
 
-POLL_INTERVAL = 5   # seconds between DB polls
+POLL_INTERVAL = 5
+DEBOUNCE_WINDOW_SECS = 2
+last_processed_time = {}
 
 
-# ── DB Helpers ─────────────────────────────────────────────────────────────────
+def _utc_now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _log_event(event, **payload):
+    logger.info(json.dumps({"event": event, **payload, "timestamp": _utc_now_iso()}))
+
 
 def _fetch_unprocessed_threats():
-    """Fetch all unprocessed threats ordered by timestamp."""
     rows = safe_execute(
-        "SELECT threat_id, session_id, threat_type, severity, experiment_type, experiment_intensity, experiment_duration FROM threats WHERE processed = 0 ORDER BY timestamp ASC",
-        fetch=True
+        """
+        SELECT threat_id, session_id, threat_type, severity, experiment_type, experiment_intensity, experiment_duration
+        FROM threats
+        WHERE processed = 0
+        ORDER BY timestamp ASC
+        """,
+        fetch=True,
     )
     return rows or []
 
 
-def _get_chaos_intensity(session_id: str, threat_type: str) -> int:
-    """Get current chaos intensity level from adaptive_scores."""
-    rows = safe_execute(
-        "SELECT chaos_intensity_level FROM adaptive_scores WHERE session_id = ? AND threat_type = ?",
-        params=(session_id, threat_type),
-        fetch=True
-    )
-    if rows:
-        return rows[0][0]
-    return 1  # Default intensity
-
-
-def _insert_chaos_result(threat_id: int, metrics: dict, is_retest: int = 0):
-    """Insert experiment metrics into chaos_results table."""
+def _insert_chaos_result(threat_id: int, metrics: dict):
     conn = get_connection()
     try:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            INSERT INTO chaos_results (
-                threat_id, experiment_type, intensity_level,
-                cpu_peak, memory_peak, disk_io_peak,
-                duration_secs, recovery_time_secs, result,
-                started_at, completed_at, notes, is_retest
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                threat_id,
-                metrics["experiment_type"],
-                metrics["intensity_level"],
-                metrics["cpu_peak"],
-                metrics["memory_peak"],
-                metrics["disk_io_peak"],
-                metrics["duration_secs"],
-                metrics["recovery_time_secs"],
-                metrics["result"],
-                datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-                datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-                metrics.get("notes", ""),
-                is_retest,
+        with conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO chaos_results (
+                    threat_id, experiment_type, intensity_level,
+                    cpu_peak, memory_peak, disk_io_peak,
+                    duration_secs, recovery_time_secs, result,
+                    started_at, completed_at, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    threat_id,
+                    metrics.get("experiment_type", "cpu_stress"),
+                    metrics.get("intensity_level", 1),
+                    metrics.get("cpu_peak", 0.0),
+                    metrics.get("memory_peak", 0.0),
+                    metrics.get("disk_io_peak", 0.0),
+                    metrics.get("duration_secs", 0),
+                    metrics.get("recovery_time_secs", 0.0),
+                    metrics.get("result", "Resilient"),
+                    _utc_now_iso(),
+                    _utc_now_iso(),
+                    metrics.get("notes", ""),
+                ),
             )
-        )
-        conn.commit()
-        logger.info(f"[Chaos] Result stored → experiment_id={cursor.lastrowid}")
     finally:
         conn.close()
 
 
 def _mark_threat_processed(threat_id: int):
-    """Mark threat as processed in DB."""
-    safe_execute(
-        "UPDATE threats SET processed = 1 WHERE threat_id = ?",
-        params=(threat_id,)
-    )
+    safe_execute("UPDATE threats SET processed = 1 WHERE threat_id = ?", (threat_id,))
 
 
-# ── Core Watcher Loop ──────────────────────────────────────────────────────────
+def _should_debounce(threat_type: str) -> bool:
+    now = datetime.now(timezone.utc)
+    stale_keys = [key for key, seen in last_processed_time.items() if (now - seen).total_seconds() > 60]
+    for key in stale_keys:
+        last_processed_time.pop(key, None)
+    last_seen = last_processed_time.get(threat_type)
+    if last_seen and (now - last_seen).total_seconds() < DEBOUNCE_WINDOW_SECS:
+        return True
+    last_processed_time[threat_type] = now
+    return False
+
+
+def _resolve_experiment_config(threat_type, severity, db_exp_type, db_exp_int, db_exp_dur):
+    source = "db"
+    config = {
+        "type": db_exp_type,
+        "intensity": db_exp_int,
+        "duration": db_exp_dur,
+    }
+
+    if not db_exp_type:
+        source = "rule"
+        config = get_rule_based_experiment(threat_type, severity)
+
+    if source == "rule" and config.get("confidence", 0.0) < 0.9:
+        ai_config = generate_experiment_with_ai(threat_type, severity)
+        if ai_config:
+            config = ai_config
+            source = "ai"
+
+    return validate_experiment_config(config), source
+
 
 def _watcher_loop():
-    """
-    Main watcher loop — runs forever as a daemon thread.
-    Polls DB every POLL_INTERVAL seconds.
-    """
-    logger.info(f"[Chaos] Watcher started — polling every {POLL_INTERVAL}s")
+    _log_event("watcher_started", command="", threat_type="", source="watcher", risk_score=0.0)
 
     while True:
         try:
-            threats = _fetch_unprocessed_threats()
-
-            if threats:
-                logger.info(f"[Chaos] Found {len(threats)} unprocessed threat(s)")
-
-            for row in threats:
-                threat_id   = row[0]
-                session_id  = row[1]
+            for row in _fetch_unprocessed_threats():
+                threat_id = row[0]
+                session_id = row[1]
                 threat_type = row[2]
-                severity    = row[3]
-                exp_type    = row[4]
-                exp_intensity = row[5]
-                exp_duration  = row[6]
+                severity = row[3]
+                db_exp_type = row[4]
+                db_exp_int = row[5]
+                db_exp_dur = row[6]
 
-                logger.info(
-                    f"[Chaos] Processing threat_id={threat_id} "
-                    f"type={threat_type} severity={severity}"
+                if _should_debounce(threat_type):
+                    continue
+
+                check_and_reset_scaling(session_id, threat_type)
+                config, source = _resolve_experiment_config(
+                    threat_type,
+                    severity,
+                    db_exp_type,
+                    db_exp_int,
+                    db_exp_dur,
                 )
 
-                try:
-                    # ── Step 1: Run Primary Experiment ────────────────────────
-                    logger.info(
-                        f"[Chaos] Running Primary Test {exp_type} "
-                        f"intensity={exp_intensity} duration={exp_duration}s"
+                adaptive_state = get_adaptive_state(session_id, threat_type)
+                is_scaled = adaptive_state["is_scaled"]
+
+                logger.info(
+                    json.dumps(
+                        {
+                            "event": "experiment_start",
+                            "command": "",
+                            "threat_type": threat_type,
+                            "source": source,
+                            "risk_score": adaptive_state["predicted_risk_score"],
+                            "experiment_type": config["type"],
+                            "scaled": is_scaled,
+                            "timestamp": _utc_now_iso(),
+                        }
                     )
+                )
+                metrics = run_experiment(
+                    config["type"],
+                    config["duration"],
+                    config["intensity"],
+                    is_scaled,
+                )
+                _insert_chaos_result(threat_id, metrics)
 
-                    metrics = run_experiment(exp_type, exp_duration, exp_intensity)
-                    _insert_chaos_result(threat_id, metrics, is_retest=0)
-                    update_adaptive_score(session_id, threat_type)
+                is_failure = metrics.get("result") == "Vulnerable"
+                update_session_metrics(session_id, threat_type, is_failure)
+                upsert_global_threat_stats(threat_type, is_failure, config["intensity"])
 
-                    logger.info(f"[Chaos] ✓ Primary Result: {metrics['result']}")
+                stats = get_threat_prediction(threat_type)
+                update_prediction_metrics(session_id, threat_type, stats["failure_rate"], stats["risk_score"])
 
-                    # ── Step 2: Adaptive Engine (NEW) ──────────────────────────
-                    if metrics["result"] == "Vulnerable":
-                        logger.warning(f"[Chaos] 🚨 System Vulnerable! Activating Adaptive Engine.")
-                        mark_weakness(session_id, threat_type)
-                        increase_intensity(session_id, threat_type)
-                        simulate_scaling(session_id, threat_type) # Simulate stronger system for re-test
+                latest_state = get_adaptive_state(session_id, threat_type)
+                scaled_now = False
+                if latest_state["total_runs"] >= 5 and stats["failure_rate"] >= 0.6:
+                    scaled_now = simulate_scaling(session_id, threat_type)
+                    if scaled_now:
+                        _log_event("scaling_triggered", command="", threat_type=threat_type, source="adaptive", risk_score=stats["risk_score"])
+                        latest_state = get_adaptive_state(session_id, threat_type)
 
-                        # Fetch improved configuration
-                        new_intensity = _get_chaos_intensity(session_id, threat_type)
-                        logger.info(f"[Chaos] Re-testing with simulated scaling (intensity {new_intensity})")
-                        
-                        # ── Step 3: Re-Test ──────────────────────────────────────
-                        retest_metrics = run_experiment(exp_type, exp_duration, new_intensity)
-                        _insert_chaos_result(threat_id, retest_metrics, is_retest=1)
+                if stats["failure_rate"] >= 0.6:
+                    mark_weakness(session_id, threat_type)
 
-                        if retest_metrics["result"] == "Resilient":
-                            logger.info("[Chaos] 🛡️ Re-test Resilient! System successfully demonstrated adaptation.")
-                        else:
-                            logger.warning("[Chaos] 🚨 Re-test Vulnerable. Weakness persists.")
-
-                    # ── Step 4: Mark processed ─────────────────────────────────
-                    _mark_threat_processed(threat_id)
-
-                except Exception as e:
-                    logger.error(
-                        f"[Chaos] Failed to process threat_id={threat_id}: {e}",
-                        exc_info=True
-                    )
-                    # Still mark as processed to avoid infinite retry loop
-                    _mark_threat_processed(threat_id)
-
-        except Exception as e:
-            logger.error(f"[Chaos] Watcher loop error: {e}", exc_info=True)
+                _log_event(
+                    "experiment_complete",
+                    command="",
+                    threat_type=threat_type,
+                    source=source,
+                    risk_score=stats["risk_score"],
+                    result=metrics.get("result", "Resilient"),
+                    failure_rate=stats["failure_rate"],
+                    scaled=latest_state["is_scaled"],
+                )
+                _mark_threat_processed(threat_id)
+        except Exception as exc:
+            logger.error(json.dumps({"event": "watcher_error", "command": "", "threat_type": "", "source": "watcher", "risk_score": 0.0, "error": str(exc)}), exc_info=True)
 
         time.sleep(POLL_INTERVAL)
 
 
-# ── Public Interface ───────────────────────────────────────────────────────────
-
 def start_chaos_watcher():
-    """
-    Start the chaos watcher as a background daemon thread.
-    Called once from core/main.py at startup.
-    """
-    thread = threading.Thread(
-        target=_watcher_loop,
-        name="ChaosWatcher",
-        daemon=True   # Dies automatically when main process exits
-    )
+    thread = threading.Thread(target=_watcher_loop, name="ChaosWatcher", daemon=True)
     thread.start()
-    logger.info("[Chaos] Watcher thread launched")
     return thread

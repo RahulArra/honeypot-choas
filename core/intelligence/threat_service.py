@@ -17,6 +17,9 @@ This file handles:
 """
 
 import logging
+import json
+from collections import OrderedDict
+
 from core.intelligence.classifier import classify_command
 from core.intelligence.ai_classifier import classify_with_ai
 from core.database.db_client import safe_execute
@@ -28,11 +31,13 @@ logger = logging.getLogger(__name__)
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 NON_THREAT_TYPES = {"Benign", "Unknown"}
+CACHE_MAX_SIZE = 256
+AI_CONFIDENCE_THRESHOLD = 0.6
 
 # Commands handled by virtual filesystem — skip classification entirely
 SAFE_COMMANDS = {
     "ls", "pwd", "cd", "mkdir", "touch",
-    "rm", "rmdir", "cat", "echo", "clear",
+    "rmdir", "echo", "clear",
     "exit", "logout"
 }
 
@@ -41,14 +46,15 @@ RULE_FAKE_RESPONSES = {
     "wget":  "Connecting to {host}... HTTP request sent, awaiting response... 200 OK\nSaving to: '{file}'\n{file} 100%[=================================================>] 1.00K  --.-KB/s",
     "curl":  "  % Total    % Received % Xferd  Average Speed\n100  1024  100  1024    0     0   2048      0 --:--:-- --:--:-- 0",
     "sudo":  "[sudo] password for root:",
-    "chmod": "",
+    "chmod": "mode of '/tmp/agent.bin' changed from 0644 (rw-r--r--) to 0777 (rwxrwxrwx)",
+    "default": "Process completed successfully.\nNo terminal errors were reported.",
 }
 
 # ── DB-backed AI cache ─────────────────────────────────────────────────────────
 
 def _load_ai_cache_from_db() -> dict:
     """Load previously AI-classified commands from DB into memory on startup."""
-    cache = {}
+    cache = OrderedDict()
     try:
         rows = safe_execute(
             """
@@ -66,12 +72,14 @@ def _load_ai_cache_from_db() -> dict:
                 cmd = row[0]
                 if cmd and cmd not in cache:
                     cache[cmd] = {
-                        "shell_response": row[1] or "bash: command not found",
+                        "shell_response": row[1] or RULE_FAKE_RESPONSES["default"],
                         "threat_type":    row[2] or "Unknown",
                         "severity":       row[3] or "Low",
                         "confidence":     float(row[4]) if row[4] else 0.0,
                         "experiment":     {"type": row[5] or "cpu_stress", "intensity": row[6] or 1, "duration": row[7] or 10}
                     }
+                    if len(cache) > CACHE_MAX_SIZE:
+                        cache.popitem(last=False)
             logger.info(f"[ThreatService] Loaded {len(cache)} AI-learned commands from DB")
         else:
             logger.info("[ThreatService] No AI-learned commands in DB yet")
@@ -95,7 +103,29 @@ def _fake_response_for_rule(raw_input: str) -> str:
         host     = url.split("/")[2] if len(url.split("/")) > 2 else "unknown"
         return RULE_FAKE_RESPONSES["wget"].format(host=host, file=filename)
 
-    return RULE_FAKE_RESPONSES.get(cmd, f"bash: {cmd}: command not found")
+    return RULE_FAKE_RESPONSES.get(cmd, RULE_FAKE_RESPONSES["default"])
+
+
+def _normalize_cache_key(raw_input: str) -> str:
+    return " ".join((raw_input or "").strip().lower().split())
+
+
+def _cache_get(cache_key):
+    cached = _AI_CACHE.get(cache_key)
+    if cached is not None:
+        _AI_CACHE.move_to_end(cache_key)
+    return cached
+
+
+def _cache_put(cache_key, value):
+    _AI_CACHE[cache_key] = value
+    _AI_CACHE.move_to_end(cache_key)
+    if len(_AI_CACHE) > CACHE_MAX_SIZE:
+        _AI_CACHE.popitem(last=False)
+
+
+def _log_event(event, **payload):
+    logger.info(json.dumps({"event": event, **payload}))
 
 # ── Main Orchestrator ──────────────────────────────────────────────────────────
 
@@ -119,14 +149,6 @@ def handle_threat_detection(
     if session_fs is None:
         session_fs = {}
 
-    # Normalize the key — strip whitespace + lowercase to avoid cache misses like '  whoami'
-    cmd_token = raw_input.strip().lower().split()[0] if raw_input.strip() else ""
-
-    # Early exit: ignore blank lines, shell comments, pure whitespace
-    if not cmd_token or raw_input.strip().startswith("#"):
-        return result
-
-    # ── Safe defaults ──────────────────────────────────────────────────────────
     result = {
         "detected":          False,
         "type":              "Unknown",
@@ -135,13 +157,22 @@ def handle_threat_detection(
         "source":            "unknown",
         "adaptive_severity": "Low",
         "chaos_level":       1,
-        "shell_response":    f"bash: {cmd_token or 'command'}: command not found",
+        "shell_response":    RULE_FAKE_RESPONSES["default"],
     }
+
+    cache_key = _normalize_cache_key(raw_input)
+    cmd_token = raw_input.strip().lower().split()[0] if raw_input.strip() else ""
+
+    # Early exit: ignore blank lines, shell comments, pure whitespace
+    if not cmd_token or raw_input.strip().startswith("#"):
+        return result
+
+    result["shell_response"] = RULE_FAKE_RESPONSES["default"]
 
     try:
         # ── Step 0: Skip safe filesystem commands ──────────────────────────────
         if cmd_token in SAFE_COMMANDS:
-            logger.debug(f"[ThreatService] '{cmd_token}' is safe — skipping")
+            _log_event("safe_command_skip", command=cache_key, source="safe_list", threat_type="Unknown", risk_score=0.0)
             return result
 
         # ── Step 1: Rule Engine ────────────────────────────────────────────────
@@ -150,13 +181,20 @@ def handle_threat_detection(
 
         if threat_data is not None:
             result["shell_response"] = _fake_response_for_rule(raw_input)
+            _log_event(
+                "rule_match",
+                command=cache_key,
+                threat_type=threat_data["type"],
+                source="rule",
+                risk_score=0.0,
+            )
 
         # ── Step 2: Cache check then AI fallback ───────────────────────────────
         if threat_data is None:
-            if cmd_token in _AI_CACHE:
+            cached = _cache_get(cache_key)
+            if cached is not None:
                 # ── Cache hit — no AI call needed ──────────────────────────────
-                cached = _AI_CACHE[cmd_token]
-                logger.info(f"[ThreatService] Cache hit for '{cmd_token}' — skipping AI")
+                _log_event("ai_cache_hit", command=cache_key, threat_type=cached["threat_type"], source="cache", risk_score=0.0)
                 result["shell_response"] = cached["shell_response"]
 
                 if cached["threat_type"] not in NON_THREAT_TYPES:
@@ -172,12 +210,19 @@ def handle_threat_detection(
 
             else:
                 # ── Cache miss — call AI ───────────────────────────────────────
-                logger.info(f"[ThreatService] Cache miss for '{cmd_token}' → calling AI")
+                _log_event("ai_cache_miss", command=cache_key, threat_type="Unknown", source="ai", risk_score=0.0)
                 ai_result = classify_with_ai(raw_input, current_dir, session_fs)
 
                 result["shell_response"] = ai_result["shell_response"]
 
-                # Determine response_type before caching
+                if ai_result["confidence"] < AI_CONFIDENCE_THRESHOLD:
+                    ai_result = {
+                        **ai_result,
+                        "threat_type": "Unknown",
+                        "severity": "Low",
+                        "confidence": 0.0,
+                    }
+
                 response_type = "ai" if ai_result["threat_type"] not in NON_THREAT_TYPES else "unknown"
 
                 # Update DB record with correct response_type and shell response
@@ -188,14 +233,13 @@ def handle_threat_detection(
                 )
 
                 # Store in memory cache for this session
-                _AI_CACHE[cmd_token] = {
+                _cache_put(cache_key, {
                     "shell_response": ai_result["shell_response"],
                     "threat_type":    ai_result["threat_type"],
                     "severity":       ai_result["severity"],
                     "confidence":     ai_result["confidence"],
                     "experiment":     ai_result.get("experiment")
-                }
-                logger.info(f"[ThreatService] Cached '{cmd_token}' for future use")
+                })
 
                 if ai_result["threat_type"] not in NON_THREAT_TYPES:
                     threat_data = {
@@ -204,15 +248,15 @@ def handle_threat_detection(
                         "confidence": ai_result["confidence"],
                         "experiment": ai_result.get("experiment")
                     }
-                    logger.info(
-                        f"[ThreatService] AI classified '{raw_input}' → "
-                        f"{threat_data['type']} ({threat_data['severity']})"
+                    _log_event(
+                        "ai_classified",
+                        command=cache_key,
+                        threat_type=threat_data["type"],
+                        source="ai",
+                        risk_score=0.0,
                     )
                 else:
-                    logger.debug(
-                        f"[ThreatService] AI returned '{ai_result['threat_type']}' "
-                        f"for '{raw_input}' — no threat"
-                    )
+                    _log_event("ai_no_threat", command=cache_key, threat_type=ai_result["threat_type"], source="ai", risk_score=0.0)
 
         # ── Step 3: Insert threat if detected ──────────────────────────────────
         if threat_data is not None:
@@ -225,18 +269,16 @@ def handle_threat_detection(
                 source=response_type,
                 experiment=threat_data.get("experiment")
             )
-            logger.info(
-                f"[ThreatService] Threat inserted → {threat_data['type']} "
-                f"(severity={threat_data['severity']}, source={response_type})"
-            )
-
             # ── Step 4: Adaptive score update ──────────────────────────────────
             new_severity, new_intensity = update_adaptive_score(
                 session_id, threat_data["type"]
             )
-            logger.info(
-                f"[ThreatService] Adaptive update → "
-                f"severity={new_severity}, chaos_level={new_intensity}"
+            _log_event(
+                "threat_persisted",
+                command=cache_key,
+                threat_type=threat_data["type"],
+                source=response_type,
+                risk_score=0.0,
             )
 
             result.update({
@@ -250,9 +292,6 @@ def handle_threat_detection(
             })
 
     except Exception as e:
-        logger.error(
-            f"[ThreatService] Unhandled exception for '{raw_input}': {e}",
-            exc_info=True
-        )
+        logger.error(json.dumps({"event": "threat_service_error", "command": cache_key, "error": str(e)}), exc_info=True)
 
     return result

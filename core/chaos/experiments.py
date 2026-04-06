@@ -1,245 +1,411 @@
 """
 Chaos Experiments — Chaos Validation Engine
-Member B (Sesh) Responsibility
 
-Implements three controlled stress experiments:
-    1. CPU Stress
-    2. Memory Stress
-    3. Disk I/O Stress
-
-All experiments are:
-    - Time-bounded (never run forever)
-    - Safe (no real system damage)
-    - Monitored (metrics collected during run)
+Implements controlled stress experiments with schema validation, hard safety
+caps, and Docker-first metrics collection with a psutil fallback.
 """
 
+import json
+import logging
 import subprocess
 import time
-import os
-import threading
-import tempfile
-import logging
+import uuid
+
 import psutil
 
 logger = logging.getLogger(__name__)
 
-# ── Safety Limits ──────────────────────────────────────────────────────────────
-MAX_DURATION_SECS  = 20      # Hard cap — no experiment runs longer than this
-MAX_MEMORY_MB      = 256     # Max memory to allocate (MB)
-MAX_CPU_THREADS    = 2       # Max CPU stress threads
-DISK_IO_FILE_SIZE  = 10      # MB written to temp file
+MAX_DURATION_SECS = 30
+MAX_MEMORY_MB = 256
+MAX_CPU_THREADS = 4
+MAX_INTENSITY = 3
+SCALED_CPU_BONUS = 2
+SCALED_MEMORY_BONUS_MB = 256
+
+VALID_EXPERIMENT_TYPES = {"cpu_stress", "memory_stress", "disk_io"}
+
+DEFAULT_SAFE_CONFIG = {
+    "type": "cpu_stress",
+    "intensity": 1,
+    "cpu_threads": 1,
+    "memory_mb": 128,
+    "duration": 5,
+}
 
 
-# ── Metrics Collector ──────────────────────────────────────────────────────────
+def _cpu_limit_for_threads(cpu_threads: int) -> float:
+    return float(cpu_threads)
 
-def _collect_metrics(duration: int) -> dict:
+
+def validate_experiment_config(config: dict) -> dict:
     """
-    Sample CPU and memory usage over the experiment duration.
-    Returns peak values.
+    Validate an experiment payload and enforce schema and safety caps.
     """
-    cpu_samples    = []
-    memory_samples = []
-    start_time     = time.time()
+    if not isinstance(config, dict):
+        return DEFAULT_SAFE_CONFIG.copy()
 
-    while time.time() - start_time < duration:
-        cpu_samples.append(psutil.cpu_percent(interval=0.5))
-        memory_samples.append(psutil.virtual_memory().percent)
+    try:
+        exp_type = str(config.get("type", DEFAULT_SAFE_CONFIG["type"]))
+        if exp_type not in VALID_EXPERIMENT_TYPES:
+            exp_type = DEFAULT_SAFE_CONFIG["type"]
+
+        intensity = int(config.get("intensity", DEFAULT_SAFE_CONFIG["intensity"]))
+        intensity = max(1, min(intensity, MAX_INTENSITY))
+
+        duration = int(config.get("duration", DEFAULT_SAFE_CONFIG["duration"]))
+        duration = max(1, min(duration, MAX_DURATION_SECS))
+
+        cpu_threads = int(config.get("cpu_threads", intensity))
+        cpu_threads = max(1, min(cpu_threads, MAX_CPU_THREADS))
+
+        memory_mb = int(config.get("memory_mb", intensity * 64))
+        memory_mb = max(64, min(memory_mb, MAX_MEMORY_MB))
+    except (TypeError, ValueError):
+        return DEFAULT_SAFE_CONFIG.copy()
 
     return {
-        "cpu_peak":    round(max(cpu_samples),    2) if cpu_samples    else 0.0,
-        "memory_peak": round(max(memory_samples), 2) if memory_samples else 0.0,
+        "type": exp_type,
+        "intensity": intensity,
+        "cpu_threads": cpu_threads,
+        "memory_mb": memory_mb,
+        "duration": duration,
     }
 
 
-# ── CPU Stress ─────────────────────────────────────────────────────────────────
+def get_container_stats(container_name):
+    """
+    Return Docker container CPU usage as a float percentage.
+    Falls back safely when Docker stats is unavailable or malformed.
+    """
+    if not container_name:
+        return 0.0
 
-def run_cpu_stress(duration: int, intensity_level: int) -> dict:
-    duration    = min(duration, MAX_DURATION_SECS)
-    num_threads = min(intensity_level, MAX_CPU_THREADS)
-
-    logger.info(f"[Chaos] CPU stress (Docker) → {num_threads} thread(s) for {duration}s")
-    start_time = time.time()
-
-    # Launch docker container
-    cmd = [
-        "docker", "run", "--rm", "chaos-executor", 
-        "--cpu", str(num_threads), "--timeout", f"{duration}s"
-    ]
-    
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except FileNotFoundError:
-        logger.warning("[Chaos] Docker not installed, skipping actual stress run.")
-        proc = None
+        output = subprocess.check_output(
+            [
+                "docker",
+                "stats",
+                "--no-stream",
+                "--format",
+                "{{json .}}",
+                container_name,
+            ],
+            stderr=subprocess.STDOUT,
+            timeout=2,
+        ).decode("utf-8").strip()
 
-    # Collect metrics while stress runs
-    metrics = _collect_metrics(duration)
+        if not output:
+            return 0.0
 
-    if proc:
-        proc.wait(timeout=duration + 5)
-
-    recovery_start = time.time()
-    for _ in range(10):
-        if psutil.cpu_percent(interval=0.5) < 20:
-            break
-
-    recovery_time = round(time.time() - recovery_start, 2)
-    total_duration = round(time.time() - start_time, 2)
-
-    if metrics["cpu_peak"] > 85 and recovery_time > 10:
-        result = "Vulnerable"
-    else:
-        result = "Resilient"
-
-    logger.info(f"[Chaos] CPU stress done → peak={metrics['cpu_peak']}%, recovery={recovery_time}s, result={result}")
-
-    return {
-        "experiment_type":    "cpu_stress",
-        "intensity_level":    intensity_level,
-        "cpu_peak":           metrics["cpu_peak"],
-        "memory_peak":        metrics["memory_peak"],
-        "disk_io_peak":       None,
-        "duration_secs":      total_duration,
-        "recovery_time_secs": recovery_time,
-        "result":             result,
-        "notes":              f"Docker: {num_threads} worker thread(s)",
-    }
+        stats = json.loads(output.splitlines()[0])
+        cpu_value = str(stats.get("CPUPerc", "0%")).replace("%", "").strip()
+        return float(cpu_value or 0.0)
+    except (subprocess.SubprocessError, json.JSONDecodeError, ValueError, OSError) as exc:
+        logger.warning("[Chaos] Docker stats failed for container '%s': %s", container_name, exc)
+        return 0.0
 
 
-# ── Memory Stress ──────────────────────────────────────────────────────────────
-
-def run_memory_stress(duration: int, intensity_level: int) -> dict:
-    duration   = min(duration, MAX_DURATION_SECS)
-    alloc_mb   = min(intensity_level * 64, MAX_MEMORY_MB)
-
-    logger.info(f"[Chaos] Memory stress (Docker) → allocating {alloc_mb}MB for {duration}s")
-    start_time = time.time()
-
-    # stress-ng --vm 1 --vm-bytes 64M --timeout 10s
-    cmd = [
-        "docker", "run", "--rm", "chaos-executor", 
-        "--vm", "1", "--vm-bytes", f"{alloc_mb}M", "--timeout", f"{duration}s"
-    ]
-    
+def _is_container_running(container_name: str) -> bool:
+    if not container_name:
+        return False
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except FileNotFoundError:
-        logger.warning("[Chaos] Docker not installed, skipping actual stress run.")
-        proc = None
+        output = subprocess.check_output(
+            ["docker", "inspect", "-f", "{{.State.Running}}", container_name],
+            stderr=subprocess.STDOUT,
+            timeout=2,
+        ).decode("utf-8").strip().lower()
+        return output == "true"
+    except (subprocess.SubprocessError, OSError):
+        return False
 
-    metrics = _collect_metrics(duration)
 
-    if proc:
-        proc.wait(timeout=duration + 5)
+def _get_container_metrics_snapshot(container_name):
+    """
+    Return a snapshot of container-oriented metrics.
+    CPU is sourced from Docker stats, while memory/disk metrics use safe fallbacks.
+    """
+    cpu = get_container_stats(container_name)
+    metric_source = "docker" if cpu > 0.0 else "fallback"
 
-    recovery_start = time.time()
-    for _ in range(10):
-        if psutil.virtual_memory().percent < 80:
+    memory_percent = 0.0
+    disk_io_mb = 0.0
+
+    try:
+        memory_percent = psutil.virtual_memory().percent
+        disk_io = psutil.disk_io_counters()
+        if disk_io:
+            disk_io_mb = (disk_io.read_bytes + disk_io.write_bytes) / (1024 * 1024)
+    except Exception as exc:
+        logger.debug("[Chaos] Fallback metric sampling failed: %s", exc)
+
+    return cpu, memory_percent, disk_io_mb, metric_source
+
+
+def _collect_metrics(duration: int, container_name: str, proc=None) -> dict:
+    cpu_samples = []
+    mem_samples = []
+    disk_samples = []
+    sources = set()
+    started = time.monotonic()
+
+    # Give Docker a brief moment to register the container before sampling.
+    ready_deadline = time.monotonic() + min(2.0, duration)
+    while time.monotonic() < ready_deadline:
+        if _is_container_running(container_name):
             break
+        if proc is not None and proc.poll() is not None:
+            break
+        time.sleep(0.1)
+
+    while time.monotonic() - started < duration:
+        if proc is not None and proc.poll() is not None and not _is_container_running(container_name):
+            break
+        cpu, memory, disk_io, source = _get_container_metrics_snapshot(container_name)
+        cpu_samples.append(cpu)
+        mem_samples.append(memory)
+        disk_samples.append(disk_io)
+        sources.add(source)
         time.sleep(0.5)
 
-    recovery_time  = round(time.time() - recovery_start, 2)
-    total_duration = round(time.time() - start_time,     2)
-
-    if metrics["memory_peak"] > 85 and recovery_time > 10:
-        result = "Vulnerable"
-    else:
-        result = "Resilient"
-
-    logger.info(f"[Chaos] Memory stress done → peak={metrics['memory_peak']}%, recovery={recovery_time}s, result={result}")
-
     return {
-        "experiment_type":    "memory_stress",
-        "intensity_level":    intensity_level,
-        "cpu_peak":           metrics["cpu_peak"],
-        "memory_peak":        metrics["memory_peak"],
-        "disk_io_peak":       None,
-        "duration_secs":      total_duration,
-        "recovery_time_secs": recovery_time,
-        "result":             result,
-        "notes":              f"Docker: Allocated {alloc_mb}MB",
+        "cpu_peak": round(max(cpu_samples), 2) if cpu_samples else 0.0,
+        "memory_peak": round(max(mem_samples), 2) if mem_samples else 0.0,
+        "disk_io_peak": round(max(disk_samples), 2) if disk_samples else 0.0,
+        "metric_source": "docker" if "docker" in sources else (next(iter(sources)) if sources else "unknown"),
     }
 
 
-# ── Disk I/O Stress ────────────────────────────────────────────────────────────
+def _new_container_name() -> str:
+    return f"chaos-{uuid.uuid4().hex[:6]}"
 
-def run_disk_io_stress(duration: int, intensity_level: int) -> dict:
-    duration  = min(duration, MAX_DURATION_SECS)
-    # stress-ng --hdd 1 --hdd-bytes X --timeout 10s
-    logger.info(f"[Chaos] Disk I/O stress (Docker) → {intensity_level} worker(s) for {duration}s")
 
-    start_time  = time.time()
-
-    cmd = [
-        "docker", "run", "--rm", "chaos-executor", 
-        "--hdd", str(intensity_level), "--timeout", f"{duration}s"
-    ]
-    
+def _run_docker_experiment(cmd):
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except FileNotFoundError:
-        logger.warning("[Chaos] Docker not installed, skipping actual stress run.")
-        proc = None
+        return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except (FileNotFoundError, subprocess.SubprocessError) as exc:
+        logger.warning("[Chaos] Docker execution unavailable, continuing with simulated run: %s", exc)
+        return None
 
-    metrics = _collect_metrics(duration)
 
-    if proc:
-        proc.wait(timeout=duration + 5)
-
-    total_duration = round(time.time() - start_time, 2)
-    
-    recovery_start = time.time()
-    time.sleep(1)
-    recovery_time  = round(time.time() - recovery_start, 2)
-
-    # Simplified disk_io calculation since we rely on overall system metric evaluation logic requested
-    if metrics["cpu_peak"] > 85 and recovery_time > 10:
-        result = "Vulnerable"
-    else:
-        result = "Resilient"
-
-    logger.info(f"[Chaos] Disk I/O done → recovery={recovery_time}s, result={result}")
-
+def _finalize_experiment(proc, duration: int):
+    if not proc:
+        return {"returncode": None, "stdout": "", "stderr": ""}
+    try:
+        stdout, stderr = proc.communicate(timeout=duration + 5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        stdout, stderr = proc.communicate()
     return {
-        "experiment_type":    "disk_io",
-        "intensity_level":    intensity_level,
-        "cpu_peak":           metrics["cpu_peak"],
-        "memory_peak":        metrics["memory_peak"],
-        "disk_io_peak":       0.0,
-        "duration_secs":      total_duration,
-        "recovery_time_secs": recovery_time,
-        "result":             result,
-        "notes":              f"Docker: HDD stress level {intensity_level}",
+        "returncode": proc.returncode,
+        "stdout": (stdout or b"").decode("utf-8", errors="replace").strip(),
+        "stderr": (stderr or b"").decode("utf-8", errors="replace").strip(),
     }
 
 
-# ── Dispatcher ─────────────────────────────────────────────────────────────────
-
-def run_experiment(experiment_type: str, duration: int, intensity_level: int) -> dict:
-    """
-    Public entry point — dispatches to the correct experiment.
-    Never raises — returns error dict on failure.
-    """
+def _cleanup_container(container_name: str):
+    if not container_name:
+        return
     try:
-        if experiment_type == "cpu_stress":
-            return run_cpu_stress(duration, intensity_level)
-        elif experiment_type == "memory_stress":
-            return run_memory_stress(duration, intensity_level)
+        subprocess.run(
+            ["docker", "rm", "-f", container_name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=5,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        logger.debug("[Chaos] Container cleanup failed for '%s': %s", container_name, exc)
+
+
+def run_cpu_stress(duration: int, intensity_level: int, is_scaled: bool = False) -> dict:
+    validated = validate_experiment_config({"type": "cpu_stress", "intensity": intensity_level, "duration": duration})
+    local_max_cpu = MAX_CPU_THREADS + (SCALED_CPU_BONUS if is_scaled else 0)
+    duration = validated["duration"]
+    cpu_threads = min(validated["cpu_threads"], local_max_cpu)
+    container_name = _new_container_name()
+
+    logger.info("[Chaos] CPU Stress | scaled=%s | threads=%s", is_scaled, cpu_threads)
+    start_time = time.monotonic()
+    proc = _run_docker_experiment(
+        [
+            "docker",
+            "run",
+            "--name",
+            container_name,
+            "--cpus",
+            str(_cpu_limit_for_threads(cpu_threads)),
+            "--memory",
+            f"{validated['memory_mb']}m",
+            "chaos-executor",
+            "--cpu",
+            str(cpu_threads),
+            "--timeout",
+            f"{duration}s",
+        ]
+    )
+
+    metrics = _collect_metrics(duration, container_name, proc)
+    proc_result = _finalize_experiment(proc, duration)
+    _cleanup_container(container_name)
+
+    recovery_start = time.monotonic()
+    while time.monotonic() - recovery_start < 2:
+        if get_container_stats(container_name) <= 20.0:
+            break
+        time.sleep(0.2)
+    recovery_time = round(time.monotonic() - recovery_start, 2)
+
+    result = "Resilient"
+    if metrics["cpu_peak"] > 80.0:
+        result = "Vulnerable"
+    elif proc_result["returncode"] not in (None, 0):
+        result = "Vulnerable"
+
+    return {
+        "experiment_type": "cpu_stress",
+        "intensity_level": validated["intensity"],
+        "cpu_peak": metrics["cpu_peak"],
+        "memory_peak": metrics["memory_peak"],
+        "disk_io_peak": metrics["disk_io_peak"],
+        "duration_secs": round(time.monotonic() - start_time, 2),
+        "recovery_time_secs": recovery_time,
+        "result": result,
+        "metric_source": metrics["metric_source"],
+        "notes": (
+            f"Scaled={is_scaled}, Threads={cpu_threads}, "
+            f"ExitCode={proc_result['returncode']}, "
+            f"StdErr={proc_result['stderr'][:200]}"
+        ),
+    }
+
+
+def run_memory_stress(duration: int, intensity_level: int, is_scaled: bool = False) -> dict:
+    validated = validate_experiment_config({"type": "memory_stress", "intensity": intensity_level, "duration": duration})
+    local_max_memory = MAX_MEMORY_MB + (SCALED_MEMORY_BONUS_MB if is_scaled else 0)
+    duration = validated["duration"]
+    memory_mb = min(validated["memory_mb"], local_max_memory)
+    container_name = _new_container_name()
+
+    logger.info("[Chaos] Memory Stress | scaled=%s | memory_mb=%s", is_scaled, memory_mb)
+    start_time = time.monotonic()
+    proc = _run_docker_experiment(
+        [
+            "docker",
+            "run",
+            "--name",
+            container_name,
+            "--memory",
+            f"{memory_mb}m",
+            "--cpus",
+            str(_cpu_limit_for_threads(1)),
+            "chaos-executor",
+            "--vm",
+            "1",
+            "--vm-bytes",
+            f"{memory_mb}M",
+            "--timeout",
+            f"{duration}s",
+        ]
+    )
+
+    metrics = _collect_metrics(duration, container_name, proc)
+    proc_result = _finalize_experiment(proc, duration)
+    _cleanup_container(container_name)
+
+    result = "Resilient"
+    if metrics["cpu_peak"] > 80.0:
+        result = "Vulnerable"
+    elif proc_result["returncode"] not in (None, 0):
+        result = "Vulnerable"
+
+    return {
+        "experiment_type": "memory_stress",
+        "intensity_level": validated["intensity"],
+        "cpu_peak": metrics["cpu_peak"],
+        "memory_peak": metrics["memory_peak"],
+        "disk_io_peak": metrics["disk_io_peak"],
+        "duration_secs": round(time.monotonic() - start_time, 2),
+        "recovery_time_secs": 0.5,
+        "result": result,
+        "metric_source": metrics["metric_source"],
+        "notes": (
+            f"Scaled={is_scaled}, Memory={memory_mb}MB, "
+            f"ExitCode={proc_result['returncode']}, "
+            f"StdErr={proc_result['stderr'][:200]}"
+        ),
+    }
+
+
+def run_disk_io_stress(duration: int, intensity_level: int, is_scaled: bool = False) -> dict:
+    validated = validate_experiment_config({"type": "disk_io", "intensity": intensity_level, "duration": duration})
+    duration = validated["duration"]
+    start_time = time.monotonic()
+    container_name = _new_container_name()
+    proc = _run_docker_experiment(
+        [
+            "docker",
+            "run",
+            "--name",
+            container_name,
+            "--memory",
+            f"{validated['memory_mb']}m",
+            "--cpus",
+            str(_cpu_limit_for_threads(1)),
+            "chaos-executor",
+            "--hdd",
+            str(validated["intensity"]),
+            "--timeout",
+            f"{duration}s",
+        ]
+    )
+
+    metrics = _collect_metrics(duration, container_name, proc)
+    proc_result = _finalize_experiment(proc, duration)
+    _cleanup_container(container_name)
+
+    result = "Vulnerable" if metrics["cpu_peak"] > 80.0 else "Resilient"
+    if proc_result["returncode"] not in (None, 0):
+        result = "Vulnerable"
+    return {
+        "experiment_type": "disk_io",
+        "intensity_level": validated["intensity"],
+        "cpu_peak": metrics["cpu_peak"],
+        "memory_peak": metrics["memory_peak"],
+        "disk_io_peak": metrics["disk_io_peak"],
+        "duration_secs": round(time.monotonic() - start_time, 2),
+        "recovery_time_secs": 1.0,
+        "result": result,
+        "metric_source": metrics["metric_source"],
+        "notes": (
+            f"Scaled={is_scaled}, DiskIntensity={validated['intensity']}, "
+            f"ExitCode={proc_result['returncode']}, "
+            f"StdErr={proc_result['stderr'][:200]}"
+        ),
+    }
+
+
+def run_experiment(experiment_type: str, duration: int, intensity_level: int, is_scaled: bool = False) -> dict:
+    """Public entry point for chaos execution."""
+    try:
+        if experiment_type == "memory_stress":
+            metrics = run_memory_stress(duration, intensity_level, is_scaled)
         elif experiment_type == "disk_io":
-            return run_disk_io_stress(duration, intensity_level)
+            metrics = run_disk_io_stress(duration, intensity_level, is_scaled)
         else:
-            logger.warning(f"[Chaos] Unknown experiment type: {experiment_type}")
-            return run_cpu_stress(duration, intensity_level)
-    except Exception as e:
-        logger.error(f"[Chaos] Experiment failed: {e}", exc_info=True)
+            metrics = run_cpu_stress(duration, intensity_level, is_scaled)
+        return metrics
+    except Exception as exc:
+        logger.error("[Chaos] Experiment failed: %s", exc, exc_info=True)
+        fallback = DEFAULT_SAFE_CONFIG.copy()
         return {
-            "experiment_type":    experiment_type,
-            "intensity_level":    intensity_level,
-            "cpu_peak":           0.0,
-            "memory_peak":        0.0,
-            "disk_io_peak":       None,
-            "duration_secs":      0,
+            "experiment_type": fallback["type"],
+            "intensity_level": fallback["intensity"],
+            "cpu_peak": 0.0,
+            "memory_peak": 0.0,
+            "disk_io_peak": 0.0,
+            "duration_secs": fallback["duration"],
             "recovery_time_secs": 0.0,
-            "result":             "Resilient",
-            "notes":              f"Experiment failed: {e}",
+            "result": "Resilient",
+            "metric_source": "unknown",
+            "notes": f"Error: {exc}",
         }

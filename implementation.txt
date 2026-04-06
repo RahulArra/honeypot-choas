@@ -1,0 +1,86 @@
+# Implementation Plan - 6 High-Impact Improvements
+
+This plan outlines the steps to implement six major improvements to the Honeypot Chaos project, focusing on realism, cross-session learning, and architectural refinement.
+
+## User Review Required
+
+> [!IMPORTANT]
+- **Timezone Consistency**: Use **UTC** for all timestamp storage and logic comparisons (`timezone.utc`).
+- **Stabilization Logic**: Use `max(total_runs, 5)` for early failure rate calculations to prevent wild fluctuations.
+- **Event Debouncing**: Implement a 2-second debounce to prevent duplicate spikes from noisy watchers.
+- **Database Migration**: These changes require updating the SQLite schema. I will update `database/schema.sql` and `core/database/init_db.py`. Existing data in `adaptive_scores` might be reset if not careful, but for this project phase, a fresh init is likely acceptable.
+- **Docker Stats**: Using `docker stats` for metrics requires the Docker daemon to be running and accessible. I will implement a fallback to `psutil` if Docker metrics fail.
+- **AI Integration**: The AI Experiment Generator assumes an LLM provider is configured (e.g., via `ai_classifier.py`).
+
+## Proposed Changes
+
+### 1. Database & Persistence (Production-Ready)
+Update the schema to support global learning, temporary scaling, and high-concurrency.
+
+#### [MODIFY] [schema.sql](file:///Users/praneethnukala/Documents/honeypot-choas/database/schema.sql)
+- **Concurrency & Performance**: 
+  - Add `PRAGMA journal_mode=WAL;`
+  - Add `PRAGMA synchronous=NORMAL;` for optimized durability.
+- **Adaptive Scores**: 
+  - Add `is_scaled` (INTEGER), `scaled_until` (DATETIME), `last_scaled_at` (DATETIME).
+  - Add `total_runs` (INTEGER), `total_failures` (INTEGER), `predicted_risk_score` (REAL).
+- **[NEW] Global Threat Stats Table**:
+  - `threat_type` (TEXT PRIMARY KEY), `total_runs` (INTEGER), `total_failures` (INTEGER), `avg_intensity` (REAL), `last_seen` (DATETIME DEFAULT CURRENT_TIMESTAMP).
+- [NEW] Analytics View:
+  - Create `v_vulnerability_metrics` with **Stable CASE Logic**: 
+    - `CASE WHEN total_runs < 5 THEN total_failures * 1.0 / 5 ELSE total_failures * 1.0 / total_runs END`.
+- [NEW] Performance Indexes:
+  - `idx_threat_last_seen ON global_threat_stats(last_seen)`
+  - `idx_adaptive_scaled ON adaptive_scores(is_scaled)`
+
+#### [MODIFY] [queries.py](file:///Users/praneethnukala/Documents/honeypot-choas/core/database/queries.py)
+- **Atomic UPSERT**: 
+  - **Correction**: `avg_intensity = min(((avg_intensity * (total_runs - 1)) + ?) / total_runs, MAX_INTENSITY)` (Hard cap at `MAX_INTENSITY`).
+  - **Safety**: Use `max(total_runs, 1)` and `max(total_failures, 0)` in calculation triggers to prevent corrupt/negative math.
+- **Normalizing Risk**: Formula `risk = (failure_rate * 0.7) + ((avg_intensity / MAX_INTENSITY) * 0.3)`.
+
+---
+
+### 2. Chaos Engine & Metrics Accuracy
+Upgrade to reliable container metrics and safe, schema-validated AI generation.
+
+#### [MODIFY] [experiments.py](file:///Users/praneethnukala/Documents/honeypot-choas/core/chaos/experiments.py)
+- **Metrics Priority**: Docker (JSON format) -> psutil fallback.
+- **Scaling Context**: Temporarily boost safety caps if scaled.
+- **Safety Defaults**: Define `DEFAULT_SAFE_CONFIG = {"cpu_threads": 1, "memory_mb": 128, "duration": 5}` for fallbacks.
+- **Safety Layer**: Implement `validate_experiment_config(config)` with schema/type checks + Hard Caps.
+
+#### [MODIFY] [ai_classifier.py](file:///Users/praneethnukala/Documents/honeypot-choas/core/intelligence/ai_classifier.py)
+- **AI Generator**: Implement `generate_experiment_with_ai(threat_type, severity)` returning structured JSON matching the engine's schema.
+
+---
+
+### 3. Watcher & Adaptive Logic (Polished)
+Refactor the watcher for clean orchestration and realistic temporal scaling.
+
+#### [MODIFY] [escalation.py](file:///Users/praneethnukala/Documents/honeypot-choas/core/adaptive/escalation.py)
+- **Temporal Scaling**: Expiry cleanup + **UTC-aware comparisons**.
+- **Simulation**: Update `scaled_until = now_utc + 5 minutes`.
+- **Safety**: Cooldown Window (2 mins) + **Per-Threat Debounce** (tracked by `threat_type`).
+
+#### [MODIFY] [watcher.py](file:///Users/praneethnukala/Documents/honeypot-choas/core/chaos/watcher.py)
+- **Phase 1: Config Discovery**: Rule -> AI Fallback -> Safety Layer.
+- **Phase 2: Execution**: Priority metrics (Docker -> psutil).
+- **Phase 3: Result Handling**:
+  - **Adaptive Engine**: Update scores/expiry.
+  - **Auto-Scaling Trigger**: `total_runs >= 5` AND `failure_rate > 0.6` AND not in cooldown.
+  - **Learning Engine**: Atomic SQL increments.
+- **Observability**: Structured **JSON Logging** including: `threat`, `source`, `result`, `failure_rate`, `scaled`, `risk_score`, and `timestamp`.
+
+## Open Questions
+
+- Should scaling duration be fixed (e.g., 5 minutes) or dynamic based on severity? (I'll start with a fixed 5-minute window).
+- For `predicted_risk_score`, should we also store historical predictions to see if the system gets "smarter"? (Out of scope for now, will keep current prediction only).
+
+## Verification Plan Upgrade
+
+### Automated & Manual Checks
+1.  **Scaling Behavior**: Trigger high load, verify `is_scaled=1` and `scaled_until` is in future. Run experiment again after expiry to confirm `is_scaled=0`.
+2.  **Cross-Session Learning**: Run attack in Session A, close app, run attack in Session B. Verify `global_threat_stats` incremental updates.
+3.  **AI Fallback & Safety**: Force a rule failure, confirm AI generator triggers, and verify `validate_experiment_config` caps any "insane" values.
+4.  **Concurrency Test**: Spam multiple commands to ensure `WAL` mode prevents "database is locked" errors.

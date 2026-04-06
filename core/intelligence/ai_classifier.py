@@ -14,8 +14,10 @@ import os
 import json
 import logging
 from typing import Optional
-from typing import Optional
 from openai import OpenAI
+
+from core.chaos.experiments import DEFAULT_SAFE_CONFIG, validate_experiment_config
+from core.intelligence.classifier import normalize_command
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +29,8 @@ GROK_MODEL    = "llama-3.3-70b-versatile"          # xAI Grok model (cost-effici
 
 MAX_RETRIES   = 2       # One initial attempt + one retry
 TIMEOUT_SECS  = 10      # Per-request timeout
+MIN_CONFIDENCE = 0.6
+MAX_SHELL_RESPONSE_CHARS = 400
 
 # Valid threat types the AI is allowed to return (keeps output controlled)
 VALID_THREAT_TYPES = {
@@ -43,6 +47,8 @@ VALID_THREAT_TYPES = {
 }
 
 VALID_SEVERITIES = {"Low", "Medium", "High"}
+
+_CLIENT = None
 
 # ── Prompt Builder ─────────────────────────────────────────────────────────────
 
@@ -94,19 +100,41 @@ def _build_user_prompt(command: str, current_dir: str, session_fs: dict) -> str:
 
 # ── Core AI Call ───────────────────────────────────────────────────────────────
 
+def _get_client():
+    global _CLIENT
+    if _CLIENT is None:
+        _CLIENT = OpenAI(
+            api_key=GROK_API_KEY,
+            base_url=GROK_BASE_URL,
+            timeout=TIMEOUT_SECS,
+        )
+    return _CLIENT
+
+
+def _safe_shell_response(command: str) -> str:
+    normalized = normalize_command(command)
+    if normalized.startswith("whoami"):
+        return "root"
+    if normalized.startswith("id"):
+        return "uid=0(root) gid=0(root) groups=0(root)"
+    if normalized.startswith("uname"):
+        return "Linux ip-172-31-18-42 5.15.0-105-generic #115-Ubuntu SMP x86_64 GNU/Linux"
+    if normalized.startswith("pwd"):
+        return "/home/root"
+    if normalized.startswith("cat "):
+        return "root:x:0:0:root:/root:/bin/bash\nsys:x:3:3:sys:/dev:/usr/sbin/nologin"
+    if normalized.startswith("ls"):
+        return "drwxr-xr-x 2 root root 4096 Apr  6 12:00 backups\n-rw-r--r-- 1 root root  512 Apr  6 11:58 notes.txt"
+    return "Process completed successfully.\nNo terminal errors were reported."
+
+
 def _call_grok(command: str, current_dir: str, session_fs: dict) -> Optional[dict]:
     """
     Single attempt to call Grok API.
     Returns parsed dict on success, None on any failure.
     """
-    client = OpenAI(
-        api_key=GROK_API_KEY,
-        base_url=GROK_BASE_URL,
-        timeout=TIMEOUT_SECS,
-    )
-
     try:
-        response = client.chat.completions.create(
+        response = _get_client().chat.completions.create(
             model=GROK_MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
@@ -117,14 +145,13 @@ def _call_grok(command: str, current_dir: str, session_fs: dict) -> Optional[dic
         )
 
         raw_text = response.choices[0].message.content.strip()
-        logger.debug(f"[AI] Raw response for '{command}': {raw_text}")
+        logger.debug("[AI] Received response for command '%s' (%s chars)", command, len(raw_text))
         raw_text = raw_text.replace("```json", "").replace("```", "").strip()
         parsed = json.loads(raw_text, strict=False)
         return parsed
 
     except json.JSONDecodeError as e:
         logger.warning(f"[AI] JSON parse failed for '{command}': {e}")
-        logger.warning(f"[AI] Raw text was: {repr(raw_text[:300])}")
         return None
     except Exception as e:
         logger.warning(f"[AI] API call failed for '{command}': {e}")
@@ -143,7 +170,7 @@ def _validate_and_clean(parsed: dict) -> Optional[dict]:
     threat_type    = parsed.get("threat_type", "Unknown")
     severity       = parsed.get("severity", "Low")
     confidence     = parsed.get("confidence", 0.5)
-    shell_response = parsed.get("shell_response", "bash: command not found")
+    shell_response = parsed.get("shell_response", _safe_shell_response(parsed.get("command", "")))
 
     # Sanitize threat_type
     if threat_type not in VALID_THREAT_TYPES:
@@ -164,15 +191,12 @@ def _validate_and_clean(parsed: dict) -> Optional[dict]:
 
     # Sanitize shell_response
     if not isinstance(shell_response, str) or not shell_response.strip():
-        shell_response = "bash: command not found"
+        shell_response = _safe_shell_response("")
+    shell_response = shell_response.strip()[:MAX_SHELL_RESPONSE_CHARS]
 
     # Sanitize experiment
     experiment_raw = parsed.get("experiment", {})
-    experiment = {
-        "type": experiment_raw.get("type", "cpu_stress") if experiment_raw.get("type") in ["cpu_stress", "memory_stress", "disk_io"] else "cpu_stress",
-        "intensity": min(max(int(experiment_raw.get("intensity", 1)), 1), 3),
-        "duration": min(max(int(experiment_raw.get("duration", 10)), 5), 20),
-    }
+    experiment = validate_experiment_config(experiment_raw)
 
     return {
         "threat_type":    threat_type,
@@ -190,8 +214,8 @@ _FALLBACK_RESULT = {
     "threat_type":    "Unknown",
     "severity":       "Low",
     "confidence":     0.0,
-    "shell_response": "bash: command not found",
-    "experiment":     {"type": "cpu_stress", "intensity": 1, "duration": 5},
+    "shell_response": "root",
+    "experiment":     DEFAULT_SAFE_CONFIG.copy(),
     "source":         "ai",
 }
 
@@ -240,6 +264,13 @@ def classify_with_ai(
         if raw_result is not None:
             cleaned = _validate_and_clean(raw_result)
             if cleaned is not None:
+                if cleaned["confidence"] < MIN_CONFIDENCE:
+                    logger.info(
+                        "[AI] Ignoring low-confidence classification for '%s' (%.2f)",
+                        command,
+                        cleaned["confidence"],
+                    )
+                    return _FALLBACK_RESULT.copy()
                 logger.info(
                     f"[AI] Classified '{command}' → {cleaned['threat_type']} "
                     f"({cleaned['severity']}, conf={cleaned['confidence']:.2f})"
@@ -252,6 +283,44 @@ def classify_with_ai(
     # Both attempts failed
     logger.error(f"[AI] All {MAX_RETRIES} attempts failed for '{command}', using fallback")
     return _FALLBACK_RESULT.copy()
+
+
+# ── AI Experiment Generator (Optional Upgrade) ────────────────────────────────
+
+def generate_experiment_with_ai(threat_type: str, severity: str) -> dict:
+    """
+    Generates a custom chaos experiment configuration using AI.
+    Includes a strict 2-second timeout and safe fallback.
+    """
+    if not GROK_API_KEY:
+        return DEFAULT_SAFE_CONFIG.copy()
+    
+    prompt = f"""Generate a JSON chaos experiment configuration for:
+Threat Type: {threat_type}
+Severity: {severity}
+
+Constraints:
+- type: one of [cpu_stress, memory_stress, disk_io]
+- intensity: integer 1-3
+- duration: integer 5-20
+
+JSON Output only:"""
+
+    try:
+        response = _get_client().chat.completions.create(
+            model=GROK_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=60,
+            temperature=0.1,
+            timeout=2  # Strict timeout for responsiveness
+        )
+        
+        text = response.choices[0].message.content.strip().replace("```json", "").replace("```", "").strip()
+        parsed = json.loads(text)
+        return validate_experiment_config(parsed)
+    except Exception as e:
+        logger.warning(f"[AI] custom experiment generation timed out or failed ({e}). Using safety default.")
+        return DEFAULT_SAFE_CONFIG.copy()
 
 
 # ── Integration Guide (for threat_service.py) ─────────────────────────────────
@@ -280,7 +349,5 @@ def classify_with_ai(
 #           insert_threat(session_id, command_id, result["type"],
 #                         result["severity"], result["confidence"], source)
 #           update_adaptive_score(session_id, result["type"], result["severity"])
-
-
 
 
