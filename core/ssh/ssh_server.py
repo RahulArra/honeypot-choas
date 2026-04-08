@@ -60,7 +60,42 @@ def handle_client(client_socket, address):
         channel.send(f"root@honeypot:{vfs.get_prompt_path()}$ ")
 
         buffer = ""
+        cursor_pos = 0
+        command_history = []
+        history_index = None
         last_activity = time.time()
+
+        def _render_input_line():
+            prompt = f"root@honeypot:{vfs.get_prompt_path()}$ "
+            channel.send(f"\r\x1b[2K{prompt}{buffer}")
+            tail = len(buffer) - cursor_pos
+            if tail > 0:
+                channel.send(f"\x1b[{tail}D")
+
+        def _history_up():
+            nonlocal buffer, cursor_pos, history_index
+            if not command_history:
+                return
+            if history_index is None:
+                history_index = len(command_history) - 1
+            else:
+                history_index = max(0, history_index - 1)
+            buffer = command_history[history_index]
+            cursor_pos = len(buffer)
+            _render_input_line()
+
+        def _history_down():
+            nonlocal buffer, cursor_pos, history_index
+            if history_index is None:
+                return
+            if history_index < len(command_history) - 1:
+                history_index += 1
+                buffer = command_history[history_index]
+            else:
+                history_index = None
+                buffer = ""
+            cursor_pos = len(buffer)
+            _render_input_line()
 
         while True:
 
@@ -80,15 +115,67 @@ def handle_client(client_socket, address):
 
             last_activity = time.time()
             text = data.decode("utf-8", errors="ignore")
+            i = 0
+            while i < len(text):
+                char = text[i]
+                # Handle ANSI escape sequences (arrow keys / delete / home / end)
+                if char == "\x1b":
+                    if i + 1 < len(text) and text[i + 1] == "[":
+                        if i + 2 < len(text):
+                            code = text[i + 2]
+                            if code == "A":  # Up
+                                _history_up()
+                                i += 3
+                                continue
+                            if code == "B":  # Down
+                                _history_down()
+                                i += 3
+                                continue
+                            if code == "C":  # Right
+                                if cursor_pos < len(buffer):
+                                    cursor_pos += 1
+                                    _render_input_line()
+                                i += 3
+                                continue
+                            if code == "D":  # Left
+                                if cursor_pos > 0:
+                                    cursor_pos -= 1
+                                    _render_input_line()
+                                i += 3
+                                continue
+                            if code == "H":  # Home
+                                cursor_pos = 0
+                                _render_input_line()
+                                i += 3
+                                continue
+                            if code == "F":  # End
+                                cursor_pos = len(buffer)
+                                _render_input_line()
+                                i += 3
+                                continue
+                            if code == "3" and i + 3 < len(text) and text[i + 3] == "~":  # Delete
+                                if cursor_pos < len(buffer):
+                                    buffer = buffer[:cursor_pos] + buffer[cursor_pos + 1:]
+                                    _render_input_line()
+                                i += 4
+                                continue
+                    # Ignore unsupported/partial escape sequence
+                    i += 1
+                    continue
 
-            for char in text:
                 # 1. Handle Enter (Carriage Return / Newline)
                 if char in ("\r", "\n"):
                     command = buffer.strip()
                     buffer = ""
+                    cursor_pos = 0
+                    history_index = None
                     channel.send("\r\n")
 
                     if command:
+                        if not command_history or command_history[-1] != command:
+                            command_history.append(command)
+                            if len(command_history) > 100:
+                                command_history = command_history[-100:]
                         session_manager.register_command(session_id)
                         
                         # 1. Parse Command — handle compound shell expressions (for loops, etc.)
@@ -273,15 +360,17 @@ def handle_client(client_socket, address):
 
                     channel.send(f"root@honeypot:{vfs.get_prompt_path()}$ ")
                 elif char in ("\x7f", "\x08"):
-                    if len(buffer) > 0:
-                        buffer = buffer[:-1]
-                        # The sequence: move cursor back, print space to erase, move back again
-                        channel.send("\b \b")
+                    if cursor_pos > 0 and len(buffer) > 0:
+                        buffer = buffer[:cursor_pos - 1] + buffer[cursor_pos:]
+                        cursor_pos -= 1
+                        _render_input_line()
 
                 # 3. Handle Ctrl+C (Interrupt)
                 elif char == "\x03":
                     channel.send("^C\r\n")
                     buffer = ""
+                    cursor_pos = 0
+                    history_index = None
                     channel.send(f"root@honeypot:{vfs.get_prompt_path()}$ ")
 
                 # 4. Handle Tab (Autocomplete - simplified for now)
@@ -289,13 +378,17 @@ def handle_client(client_socket, address):
                     # For now, just ignore or add a bell sound
                     channel.send("\x07")
                 else:
-                    if len(buffer) < MAX_COMMAND_LENGTH:
-                        buffer += char
-                        channel.send(char)
+                    if len(buffer) < MAX_COMMAND_LENGTH and char.isprintable():
+                        buffer = buffer[:cursor_pos] + char + buffer[cursor_pos:]
+                        cursor_pos += 1
+                        _render_input_line()
                     else:
                         channel.send("\r\nCommand too long (max 512 chars).\r\n")
                         buffer = ""
+                        cursor_pos = 0
+                        history_index = None
                         channel.send(f"root@honeypot:{vfs.get_prompt_path()}$ ")
+                i += 1
 
     except Exception as e:
         print(f"Connection error: {e}")

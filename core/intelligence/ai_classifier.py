@@ -209,7 +209,7 @@ def _parse_ai_json_payload(raw_text: str) -> dict:
     )
     severity_match = re.search(r'"severity"\s*:\s*"(?P<severity>Low|Medium|High)"', text)
     confidence_match = re.search(r'"confidence"\s*:\s*(?P<confidence>[0-9]*\.?[0-9]+)', text)
-    exp_type_match = re.search(r'"type"\s*:\s*"(?P<exp_type>cpu_stress|memory_stress|disk_io)"', text)
+    exp_type_match = re.search(r'"type"\s*:\s*"(?P<exp_type>cpu_stress|memory_stress|disk_io|process_disruption)"', text)
     exp_int_match = re.search(r'"intensity"\s*:\s*(?P<intensity>[1-3])', text)
     exp_dur_match = re.search(r'"duration"\s*:\s*(?P<duration>\d+)', text)
 

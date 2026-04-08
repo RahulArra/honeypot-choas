@@ -18,7 +18,7 @@ from core.chaos.experiments import validate_experiment_config
 from core.database.db_client import safe_execute
 from core.database.queries import insert_threat, update_command_response_type
 from core.intelligence.ai_classifier import classify_with_ai
-from core.intelligence.classifier import classify_command
+from core.intelligence.classifier import classify_command, normalize_command
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +88,17 @@ def _fake_response_for_rule(raw_input: str) -> str:
 
 
 def _normalize_cache_key(raw_input: str) -> str:
-    return " ".join((raw_input or "").strip().lower().split())
+    return normalize_command(raw_input)
+
+
+def _is_noise_command(raw_input: str) -> bool:
+    normalized = normalize_command(raw_input)
+    if not normalized:
+        return True
+    # Ignore control-key residue/noise that has no actionable command token.
+    if not any(ch.isalnum() for ch in normalized):
+        return True
+    return False
 
 
 def _cache_get(cache_key):
@@ -176,8 +186,12 @@ def handle_threat_detection(
     }
 
     cache_key = _normalize_cache_key(raw_input)
-    cmd_token = raw_input.strip().lower().split()[0] if raw_input.strip() else ""
-    if not cmd_token or raw_input.strip().startswith("#"):
+    if _is_noise_command(raw_input):
+        _log_event("noise_command_skip", command=cache_key, source="sanitizer", threat_type="Unknown", risk_score=0.0)
+        return result
+
+    cmd_token = cache_key.split()[0] if cache_key else ""
+    if not cmd_token or cache_key.startswith("#"):
         return result
 
     try:

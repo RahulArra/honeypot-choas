@@ -15,14 +15,16 @@ import psutil
 
 logger = logging.getLogger(__name__)
 
-MAX_DURATION_SECS = 60
+MAX_DURATION_SECS = 120
 MAX_MEMORY_MB = 512
 MAX_CPU_THREADS = 6
-MAX_INTENSITY = 6
+# Soft cap for adaptive exploration mode (normal flows still start lower).
+MAX_INTENSITY = 8
 SCALED_CPU_BONUS = 2
 SCALED_MEMORY_BONUS_MB = 256
 
 VALID_EXPERIMENT_TYPES = {"cpu_stress", "memory_stress", "disk_io", "process_disruption"}
+CPU_VARIANTS = ["hash_loop", "openssl_load", "math_compute", "multi_process"]
 
 DEFAULT_SAFE_CONFIG = {
     "type": "cpu_stress",
@@ -308,15 +310,43 @@ def _cleanup_container(container_name: str):
         logger.debug("[Chaos] Container cleanup failed for '%s': %s", container_name, exc)
 
 
-def run_cpu_stress(duration: int, intensity_level: int, is_scaled: bool = False, target_service: str = "") -> dict:
+def _build_cpu_variant_args(cpu_variant: str, cpu_threads: int, duration: int):
+    variant = (cpu_variant or "hash_loop").strip().lower()
+    if variant == "openssl_load":
+        # Use a broad CPU method set for crypto-like pressure where specific
+        # method support can vary across environments.
+        return ["--cpu", str(max(1, cpu_threads)), "--cpu-method", "all", "--timeout", f"{duration}s"], "openssl_load"
+    if variant == "math_compute":
+        return ["--matrix", str(max(1, cpu_threads)), "--matrix-size", "64", "--timeout", f"{duration}s"], "math_compute"
+    if variant == "multi_process":
+        return ["--fork", str(max(1, cpu_threads)), "--timeout", f"{duration}s"], "multi_process"
+    return ["--cpu", str(max(1, cpu_threads)), "--timeout", f"{duration}s"], "hash_loop"
+
+
+def run_cpu_stress(
+    duration: int,
+    intensity_level: int,
+    is_scaled: bool = False,
+    target_service: str = "",
+    cpu_variant: str = "hash_loop",
+    variant_combination: bool = False,
+) -> dict:
     validated = validate_experiment_config({"type": "cpu_stress", "intensity": intensity_level, "duration": duration})
     local_max_cpu = MAX_CPU_THREADS + (SCALED_CPU_BONUS if is_scaled else 0)
     duration = validated["duration"]
     cpu_threads = min(validated["cpu_threads"], local_max_cpu)
     container_name = _new_container_name()
     baseline = _capture_baseline()
+    cpu_args, normalized_variant = _build_cpu_variant_args(cpu_variant, cpu_threads, duration)
 
-    logger.info("[Chaos] CPU Stress | scaled=%s | threads=%s", is_scaled, cpu_threads)
+    logger.info(
+        "[Chaos] CPU Stress | scaled=%s | threads=%s | variant=%s | combo=%s",
+        is_scaled,
+        cpu_threads,
+        normalized_variant,
+        variant_combination,
+    )
+    combo_args = ["--vm", "1", "--vm-bytes", "64M"] if variant_combination else []
     start_time = time.monotonic()
     proc = _run_docker_experiment(
         [
@@ -329,10 +359,8 @@ def run_cpu_stress(duration: int, intensity_level: int, is_scaled: bool = False,
             "--memory",
             f"{validated['memory_mb']}m",
             "chaos-executor",
-            "--cpu",
-            str(cpu_threads),
-            "--timeout",
-            f"{duration}s",
+            *cpu_args,
+            *combo_args,
         ]
     )
 
@@ -362,7 +390,7 @@ def run_cpu_stress(duration: int, intensity_level: int, is_scaled: bool = False,
         "result": result,
         "metric_source": metrics["metric_source"],
         "notes": (
-            f"Scaled={is_scaled}, Threads={cpu_threads}, "
+            f"Scaled={is_scaled}, Threads={cpu_threads}, CpuVariant={normalized_variant}, VariantCombination={variant_combination}, "
             f"BaselineCPU={baseline['cpu']}, BaselineMem={baseline['memory']}, "
             f"CPUNormSecs={recovery['cpu_normalized_secs']}, MemStabilizedSecs={recovery['mem_stabilized_secs']}, "
             f"CPULimit={recovery['cpu_limit']}, MemLimit={recovery['mem_limit']}, "
@@ -591,6 +619,8 @@ def run_experiment(
     intensity_level: int,
     is_scaled: bool = False,
     target_service: str = "",
+    cpu_variant: str = "hash_loop",
+    variant_combination: bool = False,
 ) -> dict:
     """Public entry point for chaos execution."""
     try:
@@ -601,7 +631,7 @@ def run_experiment(
         elif experiment_type == "process_disruption":
             metrics = run_process_disruption(duration, intensity_level, is_scaled, target_service)
         else:
-            metrics = run_cpu_stress(duration, intensity_level, is_scaled, target_service)
+            metrics = run_cpu_stress(duration, intensity_level, is_scaled, target_service, cpu_variant, variant_combination)
         return metrics
     except Exception as exc:
         logger.error("[Chaos] Experiment failed: %s", exc, exc_info=True)
