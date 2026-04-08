@@ -15,4 +15,11 @@ database/*.db-shm
 
 # Environments
 venv/
-.venv/
+.venv/Commands.txt
+Commands.txt
+Commands.txt
+Commands.txt
+
+
+fake_ssh_rsa.key
+*.key

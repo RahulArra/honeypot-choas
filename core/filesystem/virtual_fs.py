@@ -21,9 +21,9 @@ class VirtualFileSystem:
         return self.cwd.replace("/home/root", "~")
 
     def list_dir(self):
-        files = self.fs.get(self.cwd, [])
-        # Using \r\n ensures the cursor returns to the start of the new line
-        return "\r\n".join(files)
+        entries = self.fs.get(self.cwd, [])
+        return "  ".join(entries)
+    
     def pwd(self):
         return self.cwd
 
@@ -69,9 +69,6 @@ class VirtualFileSystem:
         return f"rm: cannot remove '{name}': No such file"
 
     def cat(self, name):
-        if name == "credentials.txt":
-            return "admin:password123"
-        elif name in self.fs[self.cwd]:
+        if name in self.fs[self.cwd]:
             return f"Simulated content of {name}"
-        
         return f"cat: {name}: No such file"

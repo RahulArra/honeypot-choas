@@ -1,9 +1,18 @@
 import sqlite3
 
-conn = sqlite3.connect("database/honeypot.db")
-cursor = conn.cursor()
+from core.config import DATABASE_PATH
 
-cursor.execute("SELECT threat_id, threat_type, severity FROM threats;")
-print(cursor.fetchall())
 
-conn.close()
+def main():
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT threat_id, threat_type, severity FROM threats")
+    rows = cursor.fetchall()
+    conn.close()
+
+    print(f"DB: {DATABASE_PATH}")
+    print(rows)
+
+
+if __name__ == "__main__":
+    main()

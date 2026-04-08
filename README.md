@@ -115,6 +115,13 @@ Use this code:
 import sqlite3
 from core.config import DATABASE_PATH
 
+pip install dotenv
+pip install paramiko
+pip install psutil
+pip install openai
+pip install uvicorn
+pip install fastapi
+
 SCHEMA = """
 -- SESSIONS
 CREATE TABLE IF NOT EXISTS sessions (
