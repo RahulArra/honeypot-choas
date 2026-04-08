@@ -85,7 +85,7 @@ RESPONSE FORMAT (strict JSON, nothing else):
 threat_type must be one of: Malware_Download, Privilege_Escalation, Integrity_Risk, CPU_Exhaustion, Reconnaissance, Data_Exfiltration, Persistence_Attempt, Lateral_Movement, Unknown, Benign
 severity must be one of: Low, Medium, High
 confidence must be a float between 0.0 and 1.0
-experiment.type must be one of: cpu_stress, memory_stress, disk_io
+experiment.type must be one of: cpu_stress, memory_stress, disk_io, process_disruption
 experiment.intensity must be an integer between 1 and 3
 experiment.duration must be an integer between 5 and 20"""
 
@@ -373,7 +373,7 @@ Severity: {severity}
 Command: {command or "N/A"}
 
 Constraints:
-- type: one of [cpu_stress, memory_stress, disk_io]
+- type: one of [cpu_stress, memory_stress, disk_io, process_disruption]
 - intensity: integer 1-3
 - duration: integer 5-20
 

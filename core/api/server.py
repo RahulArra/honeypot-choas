@@ -52,23 +52,62 @@ def get_threats():
 
 @app.get("/api/chaos_analytics")
 def get_chaos():
+    def _parse_notes(notes):
+        parsed = {
+            "metric_source": "unknown",
+            "target_service": "",
+            "service_down_time": None,
+            "restart_attempts": None,
+        }
+        text = notes or ""
+        for part in text.split(","):
+            token = part.strip()
+            if "=" not in token:
+                continue
+            key, value = token.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if key == "MetricSource":
+                parsed["metric_source"] = value
+            elif key == "TargetService":
+                parsed["target_service"] = value
+            elif key == "ServiceDownTime":
+                try:
+                    parsed["service_down_time"] = float(value)
+                except ValueError:
+                    pass
+            elif key == "RestartAttempts":
+                try:
+                    parsed["restart_attempts"] = int(float(value))
+                except ValueError:
+                    pass
+        return parsed
+
     rows = safe_execute("""
     SELECT experiment_id, threat_id, experiment_type, intensity_level, result, cpu_peak, recovery_time_secs, started_at, is_retest, notes
     FROM chaos_results
     ORDER BY started_at DESC LIMIT 50
     """, fetch=True)
-    return [{
-        "experiment_id": r[0],
-        "threat_id": r[1],
-        "experiment_type": r[2],
-        "intensity_level": r[3],
-        "result": r[4],
-        "cpu_peak": r[5],
-        "recovery_time_secs": r[6],
-        "started_at": r[7],
-        "is_retest": r[8],
-        "notes": r[9] or "",
-    } for r in rows] if rows else []
+    data = []
+    for r in (rows or []):
+        parsed = _parse_notes(r[9] or "")
+        data.append({
+            "experiment_id": r[0],
+            "threat_id": r[1],
+            "experiment_type": r[2],
+            "intensity_level": r[3],
+            "result": r[4],
+            "cpu_peak": r[5],
+            "recovery_time_secs": r[6],
+            "started_at": r[7],
+            "is_retest": r[8],
+            "notes": r[9] or "",
+            "metric_source": parsed["metric_source"],
+            "target_service": parsed["target_service"],
+            "service_down_time": parsed["service_down_time"],
+            "restart_attempts": parsed["restart_attempts"],
+        })
+    return data
 
 
 @app.get("/api/vulnerability_metrics")

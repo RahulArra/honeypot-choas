@@ -1,7 +1,7 @@
 from core.database.db_client import get_connection, safe_execute
 from core.config import SENSOR_ID
 
-MAX_INTENSITY = 3.0
+MAX_INTENSITY = 6.0
 
 
 def insert_session(session_id, source_ip):

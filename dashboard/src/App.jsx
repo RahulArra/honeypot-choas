@@ -214,6 +214,9 @@ function App() {
                     <th>Type</th>
                     <th>CPU Peak</th>
                     <th>Metric Src</th>
+                    <th>Target</th>
+                    <th>Down (s)</th>
+                    <th>Restarts</th>
                     <th>Recovery (s)</th>
                     <th>Result</th>
                     <th>Re-Test</th>
@@ -226,13 +229,16 @@ function App() {
                       <td className="code-font">#{run.threat_id}</td>
                       <td className="code-font">{run.experiment_type} (Lv {run.intensity_level})</td>
                       <td>{run.cpu_peak}%</td>
-                      <td>{(run.notes || "").includes("MetricSource=docker") ? "docker" : "fallback"}</td>
+                      <td>{run.metric_source || ((run.notes || "").includes("MetricSource=docker") ? "docker" : "fallback")}</td>
+                      <td>{run.target_service || "-"}</td>
+                      <td>{run.service_down_time != null ? `${run.service_down_time}s` : "-"}</td>
+                      <td>{run.restart_attempts != null ? run.restart_attempts : "-"}</td>
                       <td>{run.recovery_time_secs}s</td>
                       <td><span className={`badge ${run.result === 'Resilient' ? 'low' : 'high'}`}>{run.result}</span></td>
                       <td>{run.is_retest ? 'Yes' : 'No'}</td>
                     </tr>
                   ))}
-                  {chaosData.length === 0 && <tr><td colSpan="8" style={{ textAlign: 'center' }}>No adaptive runs recorded yet.</td></tr>}
+                  {chaosData.length === 0 && <tr><td colSpan="11" style={{ textAlign: 'center' }}>No adaptive runs recorded yet.</td></tr>}
                 </tbody>
               </table>
             </div>

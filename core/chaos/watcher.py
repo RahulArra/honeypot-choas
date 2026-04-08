@@ -35,7 +35,9 @@ logger = logging.getLogger(__name__)
 
 POLL_INTERVAL = 5
 DEBOUNCE_WINDOW_SECS = 2
+COMMAND_DEDUPE_WINDOW_SECS = 5
 last_processed_time = {}
+last_processed_command_time = {}
 
 
 def _utc_now_iso():
@@ -118,6 +120,23 @@ def _should_debounce(threat_type: str) -> bool:
     return False
 
 
+def _should_skip_duplicate_command(command: str) -> bool:
+    now = datetime.now(timezone.utc)
+    normalized = " ".join((command or "").strip().lower().split())
+    if not normalized:
+        return False
+
+    stale_keys = [key for key, seen in last_processed_command_time.items() if (now - seen).total_seconds() > 60]
+    for key in stale_keys:
+        last_processed_command_time.pop(key, None)
+
+    last_seen = last_processed_command_time.get(normalized)
+    if last_seen and (now - last_seen).total_seconds() < COMMAND_DEDUPE_WINDOW_SECS:
+        return True
+    last_processed_command_time[normalized] = now
+    return False
+
+
 def _has_non_generic_db_experiment(db_exp_type, db_exp_int, db_exp_dur):
     if not db_exp_type:
         return False
@@ -136,13 +155,42 @@ def _has_non_generic_db_experiment(db_exp_type, db_exp_int, db_exp_dur):
     return not generic
 
 
-def _apply_adaptive_overrides(config: dict, historical_failure_rate: float):
+def _fetch_threat_history(threat_type: str, limit: int = 30):
+    rows = safe_execute(
+        """
+        SELECT cr.intensity_level, cr.duration_secs, cr.result
+        FROM chaos_results cr
+        JOIN threats t ON t.threat_id = cr.threat_id
+        WHERE t.threat_type = ?
+        ORDER BY cr.started_at DESC
+        LIMIT ?
+        """,
+        (threat_type, limit),
+        fetch=True,
+    )
+    return [
+        {"intensity": int(r[0] or 1), "duration": int(r[1] or 5), "result": str(r[2] or "")}
+        for r in (rows or [])
+    ]
+
+
+def _apply_adaptive_overrides(config: dict, context: dict, history: list):
     updated = dict(config)
     was_adapted = False
-    if historical_failure_rate >= 0.6:
+
+    if history:
+        # Pick strongest known config from history and push one step further.
+        best = max(history, key=lambda h: (int(h.get("intensity", 1)), int(h.get("duration", 5))))
+        prev_intensity = int(updated.get("intensity", 1))
+        prev_duration = int(updated.get("duration", 5))
+        updated["intensity"] = min(MAX_INTENSITY, max(prev_intensity, int(best.get("intensity", 1)) + 1))
+        updated["duration"] = min(MAX_DURATION_SECS, max(prev_duration, int(best.get("duration", 5)) + 5))
+        was_adapted = (updated["intensity"] != prev_intensity) or (updated["duration"] != prev_duration)
+    elif float(context.get("failure_rate", 0.0)) >= 0.6:
         updated["intensity"] = min(MAX_INTENSITY, int(updated.get("intensity", 1)) + 1)
         updated["duration"] = min(MAX_DURATION_SECS, int(updated.get("duration", 5)) + 5)
         was_adapted = True
+
     return validate_experiment_config(updated), was_adapted
 
 
@@ -183,6 +231,27 @@ def _build_retest_config(base_config: dict):
     return validate_experiment_config(retest_candidate)
 
 
+def _infer_target_service(command: str) -> str:
+    text = (command or "").lower()
+    if "sshd" in text or "ssh " in text:
+        return "sshd"
+    if "nginx" in text:
+        return "nginx"
+    if "apache2" in text or "httpd" in text or "apache" in text:
+        return "apache"
+    if "mysql" in text or "mysqld" in text:
+        return "mysql"
+    if "postgres" in text or "postgresql" in text or "psql" in text:
+        return "postgres"
+    if "redis" in text:
+        return "redis"
+    if "docker" in text or "containerd" in text:
+        return "docker"
+    if "kubelet" in text or "kubectl" in text:
+        return "kubelet"
+    return "generic"
+
+
 def _watcher_loop():
     _log_event("watcher_started", command="", threat_type="", source="watcher", risk_score=0.0)
 
@@ -200,6 +269,16 @@ def _watcher_loop():
 
                 if _should_debounce(threat_type):
                     continue
+                if _should_skip_duplicate_command(command):
+                    _mark_threat_processed(threat_id)
+                    _log_event(
+                        "duplicate_command_skipped",
+                        command=command,
+                        threat_type=threat_type,
+                        source="watcher",
+                        risk_score=0.0,
+                    )
+                    continue
 
                 check_and_reset_scaling(session_id, threat_type)
                 config, source = _resolve_experiment_config(
@@ -211,10 +290,20 @@ def _watcher_loop():
                     db_exp_dur,
                 )
                 prior_stats = get_threat_prediction(threat_type)
-                config, adapted = _apply_adaptive_overrides(config, prior_stats["failure_rate"])
+                history = _fetch_threat_history(threat_type)
+                context = {
+                    "command": command,
+                    "threat_type": threat_type,
+                    "failure_rate": prior_stats["failure_rate"],
+                    "previous_intensity": config.get("intensity", 1),
+                    "previous_duration": config.get("duration", 5),
+                    "scaled": False,
+                }
+                config, adapted = _apply_adaptive_overrides(config, context, history)
 
                 adaptive_state = get_adaptive_state(session_id, threat_type)
                 is_scaled = adaptive_state["is_scaled"]
+                target_service = _infer_target_service(command) if config["type"] == "process_disruption" else "generic"
 
                 logger.info(
                     json.dumps(
@@ -227,6 +316,7 @@ def _watcher_loop():
                             "experiment_type": config["type"],
                             "experiment_intensity": config["intensity"],
                             "experiment_duration": config["duration"],
+                            "target_service": target_service,
                             "scaled": is_scaled,
                             "timestamp": _utc_now_iso(),
                         }
@@ -237,8 +327,12 @@ def _watcher_loop():
                     config["duration"],
                     config["intensity"],
                     is_scaled,
+                    target_service,
                 )
                 _insert_chaos_result(threat_id, metrics)
+                # Recovery is computed inside run_experiment and must complete
+                # before any critical decision is made.
+                recovery_time_secs = float(metrics.get("recovery_time_secs", 0.0) or 0.0)
 
                 is_failure = metrics.get("result") == "Vulnerable"
                 update_session_metrics(session_id, threat_type, is_failure)
@@ -258,9 +352,27 @@ def _watcher_loop():
                 if stats["failure_rate"] >= 0.6:
                     mark_weakness(session_id, threat_type)
 
-                # Optional adaptive re-test: when first run is vulnerable, rerun once
-                # with stronger config and scaled resources to capture before/after proof.
-                if metrics.get("result") == "Vulnerable":
+                is_critical = (
+                    metrics.get("result") == "Vulnerable"
+                    and int(config.get("intensity", 1)) >= int(MAX_INTENSITY)
+                )
+                if is_critical:
+                    _log_event(
+                        "critical_threat_detected",
+                        command=command,
+                        threat_type=threat_type,
+                        source="adaptive",
+                        risk_score=stats["risk_score"],
+                        intensity=int(config.get("intensity", 1)),
+                        duration=int(config.get("duration", 0)),
+                        recovery_time_secs=recovery_time_secs,
+                        experiment_type=config.get("type"),
+                        target_service=target_service,
+                    )
+
+                # Optional adaptive re-test: when first run is vulnerable and not
+                # already at critical max intensity, rerun once with stronger config.
+                if metrics.get("result") == "Vulnerable" and not is_critical:
                     retest_config = _build_retest_config(config)
                     _log_event(
                         "retest_start",
@@ -271,12 +383,14 @@ def _watcher_loop():
                         experiment_type=retest_config["type"],
                         experiment_intensity=retest_config["intensity"],
                         experiment_duration=retest_config["duration"],
+                        target_service=target_service,
                     )
                     retest_metrics = run_experiment(
                         retest_config["type"],
                         retest_config["duration"],
                         retest_config["intensity"],
                         True,  # simulate protection/scaling on re-test
+                        target_service,
                     )
                     _insert_chaos_result(threat_id, retest_metrics, is_retest=True)
                     _log_event(

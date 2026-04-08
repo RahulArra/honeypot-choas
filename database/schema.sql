@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS threats (
 CREATE TABLE IF NOT EXISTS chaos_results (
     experiment_id      INTEGER PRIMARY KEY AUTOINCREMENT,
     threat_id          INTEGER NOT NULL,
-    experiment_type    TEXT NOT NULL CHECK (experiment_type IN ('cpu_stress', 'memory_stress', 'disk_io')),
+    experiment_type    TEXT NOT NULL CHECK (experiment_type IN ('cpu_stress', 'memory_stress', 'disk_io', 'process_disruption')),
     intensity_level    INTEGER NOT NULL DEFAULT 1, 
     cpu_peak           REAL,
     memory_peak        REAL,
@@ -122,7 +122,7 @@ SELECT
                 ELSE total_failures * 1.0 / MAX(total_runs, 1)
             END
         ) * 0.7 +
-        (MIN(avg_intensity, 3.0) / 3.0) * 0.3 
+        (MIN(avg_intensity, 6.0) / 6.0) * 0.3 
     ) AS risk_score
 FROM global_threat_stats;
 

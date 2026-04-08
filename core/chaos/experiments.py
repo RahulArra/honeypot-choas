@@ -15,14 +15,14 @@ import psutil
 
 logger = logging.getLogger(__name__)
 
-MAX_DURATION_SECS = 30
-MAX_MEMORY_MB = 256
-MAX_CPU_THREADS = 4
-MAX_INTENSITY = 3
+MAX_DURATION_SECS = 60
+MAX_MEMORY_MB = 512
+MAX_CPU_THREADS = 6
+MAX_INTENSITY = 6
 SCALED_CPU_BONUS = 2
 SCALED_MEMORY_BONUS_MB = 256
 
-VALID_EXPERIMENT_TYPES = {"cpu_stress", "memory_stress", "disk_io"}
+VALID_EXPERIMENT_TYPES = {"cpu_stress", "memory_stress", "disk_io", "process_disruption"}
 
 DEFAULT_SAFE_CONFIG = {
     "type": "cpu_stress",
@@ -209,6 +209,63 @@ def _collect_metrics(duration: int, container_name: str, proc=None) -> dict:
     }
 
 
+def _capture_baseline(samples: int = 3) -> dict:
+    cpu_vals = []
+    mem_vals = []
+    for _ in range(max(1, samples)):
+        try:
+            cpu_vals.append(psutil.cpu_percent(interval=0.2))
+            mem_vals.append(psutil.virtual_memory().percent)
+        except Exception:
+            cpu_vals.append(0.0)
+            mem_vals.append(0.0)
+    return {
+        "cpu": round(sum(cpu_vals) / len(cpu_vals), 2) if cpu_vals else 0.0,
+        "memory": round(sum(mem_vals) / len(mem_vals), 2) if mem_vals else 0.0,
+    }
+
+
+def _wait_for_recovery(baseline: dict, intensity: int, max_wait_secs: float) -> dict:
+    baseline_cpu = float(baseline.get("cpu", 0.0))
+    baseline_mem = float(baseline.get("memory", 0.0))
+    cpu_threshold = max(5.0, min(25.0, 4.0 + (float(intensity) * 2.5)))
+    mem_threshold = max(2.0, min(12.0, 1.5 + (float(intensity) * 1.2)))
+    cpu_limit = baseline_cpu + cpu_threshold
+    mem_limit = baseline_mem + mem_threshold
+
+    start = time.monotonic()
+    cpu_normalized_secs = None
+    mem_stabilized_secs = None
+
+    while True:
+        elapsed = time.monotonic() - start
+        if elapsed >= max_wait_secs:
+            break
+        try:
+            cpu_now = psutil.cpu_percent(interval=0.2)
+            mem_now = psutil.virtual_memory().percent
+        except Exception:
+            cpu_now = 0.0
+            mem_now = 0.0
+
+        elapsed = time.monotonic() - start
+        if cpu_normalized_secs is None and cpu_now <= cpu_limit:
+            cpu_normalized_secs = round(elapsed, 2)
+        if mem_stabilized_secs is None and mem_now <= mem_limit:
+            mem_stabilized_secs = round(elapsed, 2)
+        if cpu_normalized_secs is not None and mem_stabilized_secs is not None:
+            break
+
+    recovery_time = round(min(time.monotonic() - start, max_wait_secs), 2)
+    return {
+        "recovery_time_secs": recovery_time,
+        "cpu_normalized_secs": cpu_normalized_secs if cpu_normalized_secs is not None else round(max_wait_secs, 2),
+        "mem_stabilized_secs": mem_stabilized_secs if mem_stabilized_secs is not None else round(max_wait_secs, 2),
+        "cpu_limit": round(cpu_limit, 2),
+        "mem_limit": round(mem_limit, 2),
+    }
+
+
 def _new_container_name() -> str:
     return f"chaos-{uuid.uuid4().hex[:6]}"
 
@@ -251,12 +308,13 @@ def _cleanup_container(container_name: str):
         logger.debug("[Chaos] Container cleanup failed for '%s': %s", container_name, exc)
 
 
-def run_cpu_stress(duration: int, intensity_level: int, is_scaled: bool = False) -> dict:
+def run_cpu_stress(duration: int, intensity_level: int, is_scaled: bool = False, target_service: str = "") -> dict:
     validated = validate_experiment_config({"type": "cpu_stress", "intensity": intensity_level, "duration": duration})
     local_max_cpu = MAX_CPU_THREADS + (SCALED_CPU_BONUS if is_scaled else 0)
     duration = validated["duration"]
     cpu_threads = min(validated["cpu_threads"], local_max_cpu)
     container_name = _new_container_name()
+    baseline = _capture_baseline()
 
     logger.info("[Chaos] CPU Stress | scaled=%s | threads=%s", is_scaled, cpu_threads)
     start_time = time.monotonic()
@@ -280,16 +338,12 @@ def run_cpu_stress(duration: int, intensity_level: int, is_scaled: bool = False)
 
     metrics = _collect_metrics(duration, container_name, proc)
     proc_result = _finalize_experiment(proc, duration)
-
-    recovery_start = time.monotonic()
-    while time.monotonic() - recovery_start < 2:
-        if not _is_container_running(container_name):
-            break
-        if get_container_stats(container_name) <= 20.0:
-            break
-        time.sleep(0.2)
-    recovery_time = round(time.monotonic() - recovery_start, 2)
     _cleanup_container(container_name)
+    recovery = _wait_for_recovery(
+        baseline,
+        validated["intensity"],
+        max_wait_secs=min(30.0, max(5.0, float(duration) * 1.2)),
+    )
 
     result = "Resilient"
     if metrics["cpu_peak"] > 80.0:
@@ -304,11 +358,14 @@ def run_cpu_stress(duration: int, intensity_level: int, is_scaled: bool = False)
         "memory_peak": metrics["memory_peak"],
         "disk_io_peak": metrics["disk_io_peak"],
         "duration_secs": round(time.monotonic() - start_time, 2),
-        "recovery_time_secs": recovery_time,
+        "recovery_time_secs": recovery["recovery_time_secs"],
         "result": result,
         "metric_source": metrics["metric_source"],
         "notes": (
             f"Scaled={is_scaled}, Threads={cpu_threads}, "
+            f"BaselineCPU={baseline['cpu']}, BaselineMem={baseline['memory']}, "
+            f"CPUNormSecs={recovery['cpu_normalized_secs']}, MemStabilizedSecs={recovery['mem_stabilized_secs']}, "
+            f"CPULimit={recovery['cpu_limit']}, MemLimit={recovery['mem_limit']}, "
             f"MetricSource={metrics['metric_source']}, "
             f"ExitCode={proc_result['returncode']}, "
             f"StdErr={proc_result['stderr'][:200]}"
@@ -322,6 +379,7 @@ def run_memory_stress(duration: int, intensity_level: int, is_scaled: bool = Fal
     duration = validated["duration"]
     memory_mb = min(validated["memory_mb"], local_max_memory)
     container_name = _new_container_name()
+    baseline = _capture_baseline()
 
     logger.info("[Chaos] Memory Stress | scaled=%s | memory_mb=%s", is_scaled, memory_mb)
     start_time = time.monotonic()
@@ -348,6 +406,11 @@ def run_memory_stress(duration: int, intensity_level: int, is_scaled: bool = Fal
     metrics = _collect_metrics(duration, container_name, proc)
     proc_result = _finalize_experiment(proc, duration)
     _cleanup_container(container_name)
+    recovery = _wait_for_recovery(
+        baseline,
+        validated["intensity"],
+        max_wait_secs=min(30.0, max(5.0, float(duration) * 1.2)),
+    )
 
     result = "Resilient"
     if metrics["cpu_peak"] > 80.0:
@@ -362,11 +425,14 @@ def run_memory_stress(duration: int, intensity_level: int, is_scaled: bool = Fal
         "memory_peak": metrics["memory_peak"],
         "disk_io_peak": metrics["disk_io_peak"],
         "duration_secs": round(time.monotonic() - start_time, 2),
-        "recovery_time_secs": 0.5,
+        "recovery_time_secs": recovery["recovery_time_secs"],
         "result": result,
         "metric_source": metrics["metric_source"],
         "notes": (
             f"Scaled={is_scaled}, Memory={memory_mb}MB, "
+            f"BaselineCPU={baseline['cpu']}, BaselineMem={baseline['memory']}, "
+            f"CPUNormSecs={recovery['cpu_normalized_secs']}, MemStabilizedSecs={recovery['mem_stabilized_secs']}, "
+            f"CPULimit={recovery['cpu_limit']}, MemLimit={recovery['mem_limit']}, "
             f"MetricSource={metrics['metric_source']}, "
             f"ExitCode={proc_result['returncode']}, "
             f"StdErr={proc_result['stderr'][:200]}"
@@ -374,11 +440,12 @@ def run_memory_stress(duration: int, intensity_level: int, is_scaled: bool = Fal
     }
 
 
-def run_disk_io_stress(duration: int, intensity_level: int, is_scaled: bool = False) -> dict:
+def run_disk_io_stress(duration: int, intensity_level: int, is_scaled: bool = False, target_service: str = "") -> dict:
     validated = validate_experiment_config({"type": "disk_io", "intensity": intensity_level, "duration": duration})
     duration = validated["duration"]
     start_time = time.monotonic()
     container_name = _new_container_name()
+    baseline = _capture_baseline()
     proc = _run_docker_experiment(
         [
             "docker",
@@ -400,6 +467,11 @@ def run_disk_io_stress(duration: int, intensity_level: int, is_scaled: bool = Fa
     metrics = _collect_metrics(duration, container_name, proc)
     proc_result = _finalize_experiment(proc, duration)
     _cleanup_container(container_name)
+    recovery = _wait_for_recovery(
+        baseline,
+        validated["intensity"],
+        max_wait_secs=min(30.0, max(5.0, float(duration) * 1.2)),
+    )
 
     result = "Vulnerable" if metrics["cpu_peak"] > 80.0 else "Resilient"
     if proc_result["returncode"] not in (None, 0):
@@ -411,11 +483,14 @@ def run_disk_io_stress(duration: int, intensity_level: int, is_scaled: bool = Fa
         "memory_peak": metrics["memory_peak"],
         "disk_io_peak": metrics["disk_io_peak"],
         "duration_secs": round(time.monotonic() - start_time, 2),
-        "recovery_time_secs": 1.0,
+        "recovery_time_secs": recovery["recovery_time_secs"],
         "result": result,
         "metric_source": metrics["metric_source"],
         "notes": (
             f"Scaled={is_scaled}, DiskIntensity={validated['intensity']}, "
+            f"BaselineCPU={baseline['cpu']}, BaselineMem={baseline['memory']}, "
+            f"CPUNormSecs={recovery['cpu_normalized_secs']}, MemStabilizedSecs={recovery['mem_stabilized_secs']}, "
+            f"CPULimit={recovery['cpu_limit']}, MemLimit={recovery['mem_limit']}, "
             f"MetricSource={metrics['metric_source']}, "
             f"ExitCode={proc_result['returncode']}, "
             f"StdErr={proc_result['stderr'][:200]}"
@@ -423,15 +498,110 @@ def run_disk_io_stress(duration: int, intensity_level: int, is_scaled: bool = Fa
     }
 
 
-def run_experiment(experiment_type: str, duration: int, intensity_level: int, is_scaled: bool = False) -> dict:
+def run_process_disruption(duration: int, intensity_level: int, is_scaled: bool = False, target_service: str = "") -> dict:
+    """
+    Simulate process/service instability via controlled process-fork pressure.
+    """
+    validated = validate_experiment_config({"type": "process_disruption", "intensity": intensity_level, "duration": duration})
+    duration = validated["duration"]
+    target = (target_service or "generic").lower()
+    service_factor_map = {
+        "sshd": 1,
+        "nginx": 2,
+        "apache": 2,
+        "httpd": 2,
+        "mysql": 2,
+        "postgres": 2,
+        "redis": 2,
+        "docker": 3,
+        "kubelet": 3,
+    }
+    service_factor = service_factor_map.get(target, 1)
+    forks = max(1, min(validated["intensity"] * (2 + service_factor), 18))
+    container_name = _new_container_name()
+    start_time = time.monotonic()
+    baseline = _capture_baseline()
+    logger.info("[Chaos] Process Disruption | scaled=%s | target=%s | forks=%s", is_scaled, target, forks)
+
+    proc = _run_docker_experiment(
+        [
+            "docker",
+            "run",
+            "--name",
+            container_name,
+            "--memory",
+            f"{validated['memory_mb']}m",
+            "--cpus",
+            str(_cpu_limit_for_threads(1)),
+            "chaos-executor",
+            "--fork",
+            str(forks),
+            "--timeout",
+            f"{duration}s",
+        ]
+    )
+
+    metrics = _collect_metrics(duration, container_name, proc)
+    proc_result = _finalize_experiment(proc, duration)
+    _cleanup_container(container_name)
+    recovery = _wait_for_recovery(
+        baseline,
+        validated["intensity"],
+        max_wait_secs=min(30.0, max(5.0, float(duration) * 1.2)),
+    )
+    restart_attempts = max(1, min(validated["intensity"] + service_factor, 8))
+    if is_scaled:
+        restart_attempts = max(1, restart_attempts - 1)
+    service_down_time = round(min(float(duration), 1.2 + (validated["intensity"] * 0.9) + (service_factor * 0.6)), 2)
+
+    result = "Resilient"
+    if proc_result["returncode"] not in (None, 0):
+        result = "Vulnerable"
+    elif metrics["cpu_peak"] > 80.0:
+        result = "Vulnerable"
+
+    return {
+        "experiment_type": "process_disruption",
+        "intensity_level": validated["intensity"],
+        "cpu_peak": metrics["cpu_peak"],
+        "memory_peak": metrics["memory_peak"],
+        "disk_io_peak": metrics["disk_io_peak"],
+        "service_down_time": service_down_time,
+        "restart_attempts": restart_attempts,
+        "duration_secs": round(time.monotonic() - start_time, 2),
+        "recovery_time_secs": recovery["recovery_time_secs"],
+        "result": result,
+        "metric_source": metrics["metric_source"],
+        "notes": (
+            f"Scaled={is_scaled}, TargetService={target}, Forks={forks}, "
+            f"ServiceDownTime={service_down_time}, RestartAttempts={restart_attempts}, "
+            f"BaselineCPU={baseline['cpu']}, BaselineMem={baseline['memory']}, "
+            f"CPUNormSecs={recovery['cpu_normalized_secs']}, MemStabilizedSecs={recovery['mem_stabilized_secs']}, "
+            f"CPULimit={recovery['cpu_limit']}, MemLimit={recovery['mem_limit']}, "
+            f"MetricSource={metrics['metric_source']}, "
+            f"ExitCode={proc_result['returncode']}, "
+            f"StdErr={proc_result['stderr'][:200]}"
+        ),
+    }
+
+
+def run_experiment(
+    experiment_type: str,
+    duration: int,
+    intensity_level: int,
+    is_scaled: bool = False,
+    target_service: str = "",
+) -> dict:
     """Public entry point for chaos execution."""
     try:
         if experiment_type == "memory_stress":
             metrics = run_memory_stress(duration, intensity_level, is_scaled)
         elif experiment_type == "disk_io":
-            metrics = run_disk_io_stress(duration, intensity_level, is_scaled)
+            metrics = run_disk_io_stress(duration, intensity_level, is_scaled, target_service)
+        elif experiment_type == "process_disruption":
+            metrics = run_process_disruption(duration, intensity_level, is_scaled, target_service)
         else:
-            metrics = run_cpu_stress(duration, intensity_level, is_scaled)
+            metrics = run_cpu_stress(duration, intensity_level, is_scaled, target_service)
         return metrics
     except Exception as exc:
         logger.error("[Chaos] Experiment failed: %s", exc, exc_info=True)
