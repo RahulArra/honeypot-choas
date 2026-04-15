@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Activity, Server, Shield, Terminal, Zap } from 'lucide-react';
+import { Activity, Brain, Server, Shield, Terminal, Zap } from 'lucide-react';
 
 const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8001/api';
 
@@ -272,6 +272,7 @@ export default function App() {
           <button className={`nav-btn ${activeTab === 'activity' ? 'active' : ''}`} onClick={() => setActiveTab('activity')}><Activity size={18} /> Activity</button>
           <button className={`nav-btn ${activeTab === 'threats' ? 'active' : ''}`} onClick={() => setActiveTab('threats')}><Terminal size={18} /> Threat Feed</button>
           <button className={`nav-btn ${activeTab === 'chaos' ? 'active' : ''}`} onClick={() => setActiveTab('chaos')}><Zap size={18} /> Chaos & Risk</button>
+          <button className={`nav-btn ${activeTab === 'learning' ? 'active' : ''}`} onClick={() => setActiveTab('learning')}><Brain size={18} /> Learning & Defense</button>
         </nav>
       </div>
 
@@ -401,58 +402,75 @@ export default function App() {
               )}
             </div>
           </div>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20, marginTop: 20 }}>
-            <div className="panel">
-              <h3 style={{ marginBottom: 12, color: 'var(--text-secondary)' }}>Exploration Report</h3>
-              <p style={{ color: 'var(--text-secondary)', marginBottom: 10 }}>Lv = adaptive intensity level. Runtime settings used at that time are shown below.</p>
-              {explorationReport.slice(0, 6).map((x) => (
-                <div key={x.threat_type} style={{ marginBottom: 12, paddingBottom: 10, borderBottom: '1px dashed var(--border-glass)' }}>
-                  <p><strong>{x.threat_type.replaceAll('_', ' ')}</strong> ({x.runs} runs)</p>
-                  <p style={{ color: 'var(--text-secondary)' }}>
-                    Best: {x.best_config.type} Lv{x.best_config.intensity} ({x.best_config.duration}s)
-                    {x.best_config.variant ? `:${x.best_config.variant}` : ''} | Score {x.best_config.score}
-                  </p>
-                  <p style={{ color: 'var(--text-secondary)' }}>Settings: {configSettingsText(x.best_config)}</p>
-                  <p style={{ color: 'var(--text-secondary)' }}>
-                    Worst: {x.worst_config.type} Lv{x.worst_config.intensity} ({x.worst_config.duration}s)
-                    {x.worst_config.variant ? `:${x.worst_config.variant}` : ''} | Score {x.worst_config.score}
-                  </p>
-                  <p style={{ color: 'var(--text-secondary)' }}>Settings: {configSettingsText(x.worst_config)}</p>
-                  <p style={{ color: 'var(--text-secondary)' }}>
-                    Threshold: {x.threshold ?? '-'} | Max Instability: {Number(x.max_instability || 0).toFixed(2)}
-                  </p>
+        </div>}
+
+        {activeTab === 'learning' && <div>
+          <h1 style={{ marginBottom: 24, fontWeight: 300, fontSize: '2rem' }}>Automated Threat Defense & Intelligence</h1>
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+            {vulnerabilityMetrics.map((v) => {
+              const fr = Number(v.failure_rate || 0) * 100;
+              const isScaled = fr >= 60;
+              
+              // Find matching exploration data for this threat
+              const exp = explorationReport.find(x => x.threat_type === v.threat_type);
+              
+              // Build the plain English insights
+              let learnedText = "";
+              if (!exp) {
+                learnedText = `We have tested the system against this threat ${v.total_runs} times, but we are still gathering data to find the exact breaking point.`;
+              } else if (fr === 0) {
+                learnedText = `Good news! We have tested this threat ${v.total_runs} times, and our system has easily handled it every time. The most intense test we ran simulated an attack at Level ${exp.worst_config?.intensity || '?'}, and the resilient system remained completely stable.`;
+              } else {
+                learnedText = `We tested this threat ${v.total_runs} times and found a clear weakness. Our system crashes when the attack reaches Volume Level ${exp.threshold || (exp.worst_config?.intensity || '?')}. `;
+                if (exp.max_instability > 0.5) {
+                  learnedText += `We also learned that this attack causes severe performance instability across the server before it completely crashes.`;
+                } else {
+                  learnedText += `The system collapses cleanly when completely overwhelmed.`;
+                }
+              }
+
+              return (
+                <div key={v.threat_type} className="panel" style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid var(--border-glass)', paddingBottom: 12 }}>
+                    <h2 style={{ fontSize: '1.4rem', fontWeight: 600 }}>{v.threat_type.replaceAll('_', ' ')}</h2>
+                    <div style={{ fontSize: '0.9rem', color: 'var(--text-secondary)' }}>
+                      Tested <strong>{v.total_runs}</strong> times • Failure Rate: <strong>{fr.toFixed(0)}%</strong>
+                    </div>
+                  </div>
+                  
+                  <div>
+                    <h4 style={{ color: 'var(--accent-cyan)', marginBottom: 8, display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <Brain size={18} /> 💡 What we've learned
+                    </h4>
+                    <p style={{ color: 'var(--text-primary)', lineHeight: 1.5, fontSize: '1.05rem' }}>
+                      {learnedText}
+                    </p>
+                  </div>
+
+                  <div style={{ marginTop: 8, padding: 16, borderRadius: 8, background: isScaled ? 'rgba(0,255,160,0.05)' : 'rgba(255,255,255,0.02)', border: isScaled ? '1px solid rgba(0,255,160,0.3)' : '1px solid var(--border-glass)' }}>
+                    <h4 style={{ color: isScaled ? 'var(--success)' : 'var(--text-secondary)', marginBottom: 8, display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <Shield size={18} /> 🛡️ What defense we've made
+                    </h4>
+                    {isScaled ? (
+                      <p style={{ color: 'var(--success)', lineHeight: 1.5, fontWeight: 500, fontSize: '1.05rem' }}>
+                        ACTIVE DEFENSE TRIGGERED. Because the failure rate exceeded 60%, the system automatically activated "Simulated Scaling". It has dynamically allocated additional CPU and Memory resources to counter and absorb future attacks of this type.
+                      </p>
+                    ) : (
+                      <p style={{ color: 'var(--text-primary)', lineHeight: 1.5, fontSize: '1.05rem' }}>
+                        Monitoring only. Because the system has not shown severe vulnerability yet (failure rate is under 60%), we are not actively wasting server resources by auto-scaling. The honeypot continues to safely monitor this threat.
+                      </p>
+                    )}
+                  </div>
                 </div>
-              ))}
-              {explorationReport.length === 0 && <p>No exploration learning data yet.</p>}
-            </div>
-            <div className="panel">
-              <h3 style={{ marginBottom: 12, color: 'var(--text-secondary)' }}>Config Memory</h3>
-              <table>
-                <thead>
-                  <tr>
-                    <th>Threat</th>
-                    <th>Config</th>
-                    <th>Runs</th>
-                    <th>Avg Score</th>
-                    <th>Last3</th>
-                    <th>Trend</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {configMemory.slice(0, 8).map((c) => (
-                    <tr key={`${c.threat_type}-${c.experiment_type}-${c.intensity}-${c.duration}-${c.variant}`}>
-                      <td>{c.threat_type.replaceAll('_', ' ')}</td>
-                      <td className="code-font">{`${c.experiment_type} Lv${c.intensity}/${c.duration}s${c.variant ? `:${c.variant}` : ''}`}</td>
-                      <td>{c.runs}</td>
-                      <td>{Number(c.avg_score || 0).toFixed(2)}</td>
-                      <td>{(c.last3_scores || []).join(', ') || '-'}</td>
-                      <td><span className={`badge ${c.trend === 'degrading' ? 'high' : c.trend === 'improving' ? 'low' : 'medium'}`}>{c.trend}</span></td>
-                    </tr>
-                  ))}
-                  {configMemory.length === 0 && <tr><td colSpan="6" style={{ textAlign: 'center' }}>No config memory yet.</td></tr>}
-                </tbody>
-              </table>
-            </div>
+              );
+            })}
+            
+            {vulnerabilityMetrics.length === 0 && (
+              <div className="panel" style={{ textAlign: 'center', padding: 40, color: 'var(--text-secondary)' }}>
+                No active threats have been monitored yet. The intelligence engine is waiting.
+              </div>
+            )}
           </div>
         </div>}
 
