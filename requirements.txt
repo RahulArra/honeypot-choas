@@ -1,6 +1,0 @@
-fastapi
-uvicorn
-paramiko
-psutil
-python-dotenv
-openai
