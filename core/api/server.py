@@ -232,6 +232,118 @@ def get_session_timeline(session_id: str):
     return timeline
 
 
+@app.get("/api/sessions/{session_id}")
+def get_session_detail(session_id: str):
+    # Session metadata
+    session_row = safe_execute(
+        "SELECT session_id, source_ip, start_time, end_time, duration_secs, total_commands, status FROM sessions WHERE session_id = ?",
+        params=(session_id,), fetch=True
+    )
+    if not session_row:
+        return {"error": "Session not found"}
+    s = session_row[0]
+    session_info = {
+        "session_id": s[0],
+        "source_ip": s[1],
+        "start_time": s[2],
+        "end_time": s[3],
+        "duration_secs": s[4],
+        "total_commands": s[5],
+        "status": s[6],
+    }
+
+    # All commands for this session with threat + chaos results joined
+    rows = safe_execute(
+        """
+        SELECT
+            c.command_id,
+            c.timestamp,
+            c.raw_input,
+            c.parsed_command,
+            c.response_type,
+            t.threat_id,
+            t.threat_type,
+            t.severity,
+            t.confidence,
+            t.source,
+            t.experiment_type,
+            cr.experiment_id,
+            cr.result,
+            cr.cpu_peak,
+            cr.memory_peak,
+            cr.recovery_time_secs,
+            cr.intensity_level,
+            cr.experiment_type
+        FROM commands c
+        LEFT JOIN threats t ON t.command_id = c.command_id
+        LEFT JOIN chaos_results cr
+          ON cr.threat_id = t.threat_id
+         AND cr.experiment_id = (
+             SELECT MAX(cr2.experiment_id)
+             FROM chaos_results cr2
+             WHERE cr2.threat_id = t.threat_id
+         )
+        WHERE c.session_id = ?
+        ORDER BY c.timestamp ASC
+        """,
+        params=(session_id,), fetch=True
+    )
+
+    commands = []
+    resilient_count = 0
+    vulnerable_count = 0
+    threat_types_seen = set()
+
+    for r in (rows or []):
+        chaos_result = r[12]
+        if chaos_result == "Vulnerable":
+            vulnerable_count += 1
+        elif chaos_result == "Resilient":
+            resilient_count += 1
+        threat_type = r[6] or "None"
+        if threat_type != "None":
+            threat_types_seen.add(threat_type)
+        commands.append({
+            "command_id": r[0],
+            "timestamp": r[1],
+            "raw_input": r[2] or "",
+            "parsed_command": r[3] or "",
+            "response_type": r[4] or "unknown",
+            "threat_id": r[5],
+            "threat_type": threat_type,
+            "severity": r[7] or "None",
+            "confidence": round(float(r[8] or 0.0), 2),
+            "source": r[9] or "",
+            "experiment_type": r[17] or r[10] or "",
+            "experiment_id": r[11],
+            "chaos_result": chaos_result or "",
+            "cpu_peak": round(float(r[13] or 0.0), 2),
+            "memory_peak": round(float(r[14] or 0.0), 2),
+            "recovery_time_secs": round(float(r[15] or 0.0), 2),
+            "intensity_level": r[16],
+        })
+
+    # Determine overall session verdict
+    if vulnerable_count > 0:
+        verdict = "Suspicious"
+    elif any(c["threat_type"] != "None" for c in commands):
+        verdict = "Monitored"
+    else:
+        verdict = "Normal"
+
+    return {
+        "session": session_info,
+        "commands": commands,
+        "summary": {
+            "total_commands": len(commands),
+            "resilient_count": resilient_count,
+            "vulnerable_count": vulnerable_count,
+            "threat_types": sorted(threat_types_seen),
+            "verdict": verdict,
+        }
+    }
+
+
 @app.get("/api/session_activity")
 def get_session_activity():
     rows = safe_execute(

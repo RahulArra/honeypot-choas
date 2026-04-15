@@ -1,7 +1,7 @@
-import { useEffect, useRef, useState } from 'react';
-import { Activity, Server, Shield, Terminal, Zap } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { Activity, Brain, Server, Shield, Terminal, Zap } from 'lucide-react';
 
-const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000/api';
+const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8001/api';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('overview');
@@ -21,7 +21,8 @@ export default function App() {
   const [sessionAnalysis, setSessionAnalysis] = useState(null);
   const [sessionAnalysisLoading, setSessionAnalysisLoading] = useState(false);
   const [selectedSessionId, setSelectedSessionId] = useState(null);
-  const [overviewSection, setOverviewSection] = useState('core');
+  const [selectedSessionDetail, setSelectedSessionDetail] = useState(null);
+  const [sessionDetailLoading, setSessionDetailLoading] = useState(false);
   const [selectedThreat, setSelectedThreat] = useState(null);
   const [openExperimentId, setOpenExperimentId] = useState(null);
   const [openExperiment, setOpenExperiment] = useState(null);
@@ -40,6 +41,18 @@ export default function App() {
   const [expandedTopCommand, setExpandedTopCommand] = useState(null);
   const [expandAiInsight, setExpandAiInsight] = useState(false);
   const [apiError, setApiError] = useState('');
+
+  const fetchSessionDetail = async (sessionId) => {
+    setSessionDetailLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/sessions/${sessionId}`);
+      const data = await res.json();
+      setSelectedSessionDetail(data);
+    } catch {
+      setSelectedSessionDetail(null);
+    }
+    setSessionDetailLoading(false);
+  };
 
   const fetchData = async () => {
     try {
@@ -391,6 +404,7 @@ export default function App() {
   };
 
   return (
+    <>
     <div className="dashboard-container">
       <div className="panel" style={{ borderRadius: 0, borderTop: 0, borderBottom: 0, borderLeft: 0 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 32 }}><Shield color="var(--accent-cyan)" size={30} /><h2 style={{ fontSize: '1.1rem', letterSpacing: '1px' }}>CHAOS<span style={{ color: 'var(--accent-purple)' }}>ENGINE</span></h2></div>
@@ -400,6 +414,7 @@ export default function App() {
           <button className={`nav-btn ${activeTab === 'activity' ? 'active' : ''}`} onClick={() => setActiveTab('activity')}><Activity size={18} /> Activity</button>
           <button className={`nav-btn ${activeTab === 'threats' ? 'active' : ''}`} onClick={() => setActiveTab('threats')}><Terminal size={18} /> Threat Feed</button>
           <button className={`nav-btn ${activeTab === 'chaos' ? 'active' : ''}`} onClick={() => setActiveTab('chaos')}><Zap size={18} /> Chaos & Risk</button>
+          <button className={`nav-btn ${activeTab === 'learning' ? 'active' : ''}`} onClick={() => setActiveTab('learning')}><Brain size={18} /> Learning & Defense</button>
         </nav>
       </div>
 
@@ -559,61 +574,75 @@ export default function App() {
               )}
             </div>
           </div>
-          )}
-          {overviewSection === 'learning' && (
-            <>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20, marginTop: 20 }}>
-            <div className="panel">
-              <h3 style={{ marginBottom: 12, color: 'var(--text-secondary)' }}>Exploration Report</h3>
-              <p style={{ color: 'var(--text-secondary)', marginBottom: 10 }}>Lv = adaptive intensity level. Runtime settings used at that time are shown below.</p>
-              {explorationReport.slice(0, 6).map((x) => (
-                <div key={x.threat_type} style={{ marginBottom: 12, paddingBottom: 10, borderBottom: '1px dashed var(--border-glass)' }}>
-                  <p><strong>{x.threat_type.replaceAll('_', ' ')}</strong> ({x.runs} runs)</p>
-                  <p style={{ color: 'var(--text-secondary)' }}>
-                    Best: {x.best_config.type} Lv{x.best_config.intensity} ({x.best_config.duration}s)
-                    {x.best_config.variant ? `:${x.best_config.variant}` : ''} | Score {x.best_config.score}
-                  </p>
-                  <p style={{ color: 'var(--text-secondary)' }}>Settings: {configSettingsText(x.best_config)}</p>
-                  <p style={{ color: 'var(--text-secondary)' }}>
-                    Worst: {x.worst_config.type} Lv{x.worst_config.intensity} ({x.worst_config.duration}s)
-                    {x.worst_config.variant ? `:${x.worst_config.variant}` : ''} | Score {x.worst_config.score}
-                  </p>
-                  <p style={{ color: 'var(--text-secondary)' }}>Settings: {configSettingsText(x.worst_config)}</p>
-                  <p style={{ color: 'var(--text-secondary)' }}>
-                    Threshold: {x.threshold ?? '-'} | Max Instability: {Number(x.max_instability || 0).toFixed(2)}
-                  </p>
+        </div>}
+
+        {activeTab === 'learning' && <div>
+          <h1 style={{ marginBottom: 24, fontWeight: 300, fontSize: '2rem' }}>Automated Threat Defense & Intelligence</h1>
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+            {vulnerabilityMetrics.map((v) => {
+              const fr = Number(v.failure_rate || 0) * 100;
+              const isScaled = fr >= 60;
+              
+              // Find matching exploration data for this threat
+              const exp = explorationReport.find(x => x.threat_type === v.threat_type);
+              
+              // Build the plain English insights
+              let learnedText = "";
+              if (!exp) {
+                learnedText = `We have tested the system against this threat ${v.total_runs} times, but we are still gathering data to find the exact breaking point.`;
+              } else if (fr === 0) {
+                learnedText = `Good news! We have tested this threat ${v.total_runs} times, and our system has easily handled it every time. The most intense test we ran simulated an attack at Level ${exp.worst_config?.intensity || '?'}, and the resilient system remained completely stable.`;
+              } else {
+                learnedText = `We tested this threat ${v.total_runs} times and found a clear weakness. Our system crashes when the attack reaches Volume Level ${exp.threshold || (exp.worst_config?.intensity || '?')}. `;
+                if (exp.max_instability > 0.5) {
+                  learnedText += `We also learned that this attack causes severe performance instability across the server before it completely crashes.`;
+                } else {
+                  learnedText += `The system collapses cleanly when completely overwhelmed.`;
+                }
+              }
+
+              return (
+                <div key={v.threat_type} className="panel" style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid var(--border-glass)', paddingBottom: 12 }}>
+                    <h2 style={{ fontSize: '1.4rem', fontWeight: 600 }}>{v.threat_type.replaceAll('_', ' ')}</h2>
+                    <div style={{ fontSize: '0.9rem', color: 'var(--text-secondary)' }}>
+                      Tested <strong>{v.total_runs}</strong> times • Failure Rate: <strong>{fr.toFixed(0)}%</strong>
+                    </div>
+                  </div>
+                  
+                  <div>
+                    <h4 style={{ color: 'var(--accent-cyan)', marginBottom: 8, display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <Brain size={18} /> 💡 What we've learned
+                    </h4>
+                    <p style={{ color: 'var(--text-primary)', lineHeight: 1.5, fontSize: '1.05rem' }}>
+                      {learnedText}
+                    </p>
+                  </div>
+
+                  <div style={{ marginTop: 8, padding: 16, borderRadius: 8, background: isScaled ? 'rgba(0,255,160,0.05)' : 'rgba(255,255,255,0.02)', border: isScaled ? '1px solid rgba(0,255,160,0.3)' : '1px solid var(--border-glass)' }}>
+                    <h4 style={{ color: isScaled ? 'var(--success)' : 'var(--text-secondary)', marginBottom: 8, display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <Shield size={18} /> 🛡️ What defense we've made
+                    </h4>
+                    {isScaled ? (
+                      <p style={{ color: 'var(--success)', lineHeight: 1.5, fontWeight: 500, fontSize: '1.05rem' }}>
+                        ACTIVE DEFENSE TRIGGERED. Because the failure rate exceeded 60%, the system automatically activated "Simulated Scaling". It has dynamically allocated additional CPU and Memory resources to counter and absorb future attacks of this type.
+                      </p>
+                    ) : (
+                      <p style={{ color: 'var(--text-primary)', lineHeight: 1.5, fontSize: '1.05rem' }}>
+                        Monitoring only. Because the system has not shown severe vulnerability yet (failure rate is under 60%), we are not actively wasting server resources by auto-scaling. The honeypot continues to safely monitor this threat.
+                      </p>
+                    )}
+                  </div>
                 </div>
-              ))}
-              {explorationReport.length === 0 && <p>No exploration learning data yet.</p>}
-            </div>
-            <div className="panel">
-              <h3 style={{ marginBottom: 12, color: 'var(--text-secondary)' }}>Config Memory</h3>
-              <table>
-                <thead>
-                  <tr>
-                    <th>Threat</th>
-                    <th>Config</th>
-                    <th>Runs</th>
-                    <th>Avg Score</th>
-                    <th>Last3</th>
-                    <th>Trend</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {configMemory.slice(0, 8).map((c) => (
-                    <tr key={`${c.threat_type}-${c.experiment_type}-${c.intensity}-${c.duration}-${c.variant}`}>
-                      <td>{c.threat_type.replaceAll('_', ' ')}</td>
-                      <td className="code-font">{`${c.experiment_type} Lv${c.intensity}/${c.duration}s${c.variant ? `:${c.variant}` : ''}`}</td>
-                      <td>{c.runs}</td>
-                      <td>{Number(c.avg_score || 0).toFixed(2)}</td>
-                      <td>{(c.last3_scores || []).join(', ') || '-'}</td>
-                      <td><span className={`badge ${c.trend === 'degrading' ? 'high' : c.trend === 'improving' ? 'low' : 'medium'}`}>{c.trend}</span></td>
-                    </tr>
-                  ))}
-                  {configMemory.length === 0 && <tr><td colSpan="6" style={{ textAlign: 'center' }}>No config memory yet.</td></tr>}
-                </tbody>
-              </table>
-            </div>
+              );
+            })}
+            
+            {vulnerabilityMetrics.length === 0 && (
+              <div className="panel" style={{ textAlign: 'center', padding: 40, color: 'var(--text-secondary)' }}>
+                No active threats have been monitored yet. The intelligence engine is waiting.
+              </div>
+            )}
           </div>
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20, marginTop: 20 }}>
             <div className="panel">
@@ -693,114 +722,8 @@ export default function App() {
 
         {activeTab === 'sessions' && <div>
           <h1 style={{ marginBottom: 24, fontWeight: 300, fontSize: '2rem' }}>Session Activity</h1>
-          <div className="panel">
-            <table>
-              <thead>
-                <tr>
-                  <th>Session ID</th>
-                  <th>Source IP</th>
-                  <th>Start Time</th>
-                  <th>Commands</th>
-                  <th>Top Threat</th>
-                  <th>Failure Rate</th>
-                  <th>Status</th>
-                </tr>
-              </thead>
-              <tbody>
-                {paginatedSessions.map((s) => (
-                  <tr key={s.session_id} style={{ cursor: 'pointer', outline: selectedSessionId === s.session_id ? '1px solid var(--accent-cyan)' : 'none' }} onClick={() => { setSelectedSessionId(s.session_id); setSessionAnalysis(null); }}>
-                    <td className="code-font">{s.session_id}</td>
-                    <td>{s.source_ip}</td>
-                    <td>{s.start_time}</td>
-                    <td>{s.total_commands}</td>
-                    <td>{String(s.top_threat || 'None').replaceAll('_', ' ')}</td>
-                    <td>{`${Math.round(Number(s.failure_rate || 0) * 100)}%`}</td>
-                    <td><span className={`badge ${s.status === 'active' ? 'medium' : 'low'}`}>{s.status}</span></td>
-                  </tr>
-                ))}
-                {paginatedSessions.length === 0 && <tr><td colSpan="7" style={{ textAlign: 'center' }}>No sessions match current filter.</td></tr>}
-              </tbody>
-            </table>
-          </div>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, marginTop: 10 }}>
-            <button className="nav-btn" onClick={() => setSessionPage(Math.max(1, sessionPage - 1))} disabled={sessionPage <= 1}>Previous</button>
-            <div style={{ color: 'var(--text-secondary)' }}>Page {sessionPage} of {sessionPageCount}</div>
-            <button className="nav-btn" onClick={() => setSessionPage(Math.min(sessionPageCount, sessionPage + 1))} disabled={sessionPage >= sessionPageCount}>Next</button>
-          </div>
-          <div className="panel" ref={sessionDetailRef} style={{ marginTop: 20 }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-              <h3 style={{ marginBottom: 0, color: 'var(--text-secondary)' }}>Session-wise Commands</h3>
-              <button className="nav-btn" style={{ padding: '4px 10px' }} onClick={() => { setSelectedSessionId(null); setSessionAnalysis(null); }}>{'Close details'}</button>
-            </div>
-            <table>
-              <thead>
-                <tr>
-                  <th>Time</th>
-                  <th>Command</th>
-                  <th>Class</th>
-                  <th>Mapped Test</th>
-                  <th>Outcome</th>
-                </tr>
-              </thead>
-              <tbody>
-                {selectedSessionCommands.map((cmd) => (
-                  <tr key={`sess-cmd-${cmd.command_id}`}>
-                    <td>{cmd.timestamp}</td>
-                    <td className="code-font">{`> ${activityCommandText(cmd.raw_input) || cmd.raw_input}`}</td>
-                    <td>{cmd.threat_id ? `${cmd.threat_type.replaceAll('_', ' ')} (${cmd.severity || 'Low'})` : 'No Threat'}</td>
-                    <td className="code-font">{cmd.experiment_type || '-'}</td>
-                    <td>
-                      {cmd.result ? (
-                        <span className={`badge ${cmd.result === 'Resilient' ? 'low' : 'high'}`}>{cmd.result}</span>
-                      ) : (
-                        <span style={{ color: 'var(--text-secondary)' }}>-</span>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-                {selectedSessionCommands.length === 0 && <tr><td colSpan="5" style={{ textAlign: 'center' }}>No commands for selected session.</td></tr>}
-              </tbody>
-            </table>
-          </div>
-
-          <div className="panel" style={{ marginTop: 20 }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-              <h3 style={{ color: 'var(--text-secondary)' }}>Session Timeline Detail</h3>
-              <button className="nav-btn" onClick={runSessionAnalysis} disabled={!selectedSessionId || sessionAnalysisLoading}>
-                {sessionAnalysisLoading ? 'Analyzing...' : 'Run AI Session Analysis'}
-              </button>
-            </div>
-            {sessionTimelineData.map((step, idx) => (
-              <div key={`${step.command_id}-${step.threat_id}-${idx}`} style={{ padding: 12, marginBottom: 10, border: '1px solid var(--border-glass)', borderRadius: 10, background: 'rgba(255,255,255,0.02)' }}>
-                <p><strong>{`${idx + 1}.`}</strong> <span className="code-font">{step.command || '-'}</span></p>
-                <p>{`\u2193 Threat: ${String(step.threat_type || 'Unknown').replaceAll('_', ' ')} (${step.severity || 'Low'})`}</p>
-                <p>{`\u2193 Defense: ${step.defense_action || 'no_action'}`}</p>
-                <p>{`\u2193 Recovery: ${Number(step.recovery_time_secs || 0).toFixed(2)}s`}</p>
-                <p>
-                  {`\u2193 Result: `}
-                  <span className={`badge ${step.result === 'Resilient' ? 'low' : step.outcome_state === 'Degraded' ? 'medium' : 'high'}`}>
-                    {step.outcome_state || step.result || (step.experiment_type ? 'Pending' : 'Skipped')}
-                  </span>
-                  {!step.experiment_type && ' (lightweight/no chaos)'}
-                </p>
-              </div>
-            ))}
-            {sessionTimelineData.length === 0 && <p>No timeline data for selected session.</p>}
-          </div>
-
-          <div className="panel" style={{ marginTop: 20 }}>
-            <h3 style={{ marginBottom: 12, color: 'var(--text-secondary)' }}>AI Session Analysis</h3>
-            {sessionAnalysis ? (
-              <>
-                <p><strong>Attack Pattern:</strong> {sessionAnalysis.attack_pattern}</p>
-                <p><strong>Attacker Intent:</strong> {sessionAnalysis.attacker_intent}</p>
-                <p><strong>System Weakness:</strong> {sessionAnalysis.system_weakness}</p>
-                <p><strong>Recommendation:</strong> {sessionAnalysis.recommendation}</p>
-              </>
-            ) : (
-              <p>Select a session and click "Run AI Session Analysis".</p>
-            )}
-          </div>
+          <div className="panel"><table><thead><tr><th>Session ID</th><th>Source IP</th><th>Start Time</th><th>Commands</th><th>Status</th><th></th></tr></thead><tbody>{filteredSessions.map((s) => <tr key={s.session_id} style={{ cursor: 'pointer', outline: selectedSessionId === s.session_id ? '1px solid var(--accent-cyan)' : 'none' }} onClick={() => { setSelectedSessionId(s.session_id); fetchSessionDetail(s.session_id); }}><td className="code-font">{s.session_id}</td><td>{s.source_ip}</td><td>{s.start_time}</td><td>{s.total_commands}</td><td><span className={`badge ${s.status === 'active' ? 'medium' : 'low'}`}>{s.status}</span></td><td><span style={{ color: 'var(--accent-cyan)', fontSize: 12 }}>Investigate →</span></td></tr>)}{filteredSessions.length === 0 && <tr><td colSpan="6" style={{ textAlign: 'center' }}>No sessions match current filter.</td></tr>}</tbody></table></div>
+          <div className="panel" style={{ marginTop: 20 }}><h3 style={{ marginBottom: 12, color: 'var(--text-secondary)' }}>Session Drilldown Timeline</h3><table><thead><tr><th>Command</th><th>Threat</th><th>Experiment</th><th>Result</th><th>Recovery</th></tr></thead><tbody>{sessionTimeline.map((x) => <tr key={x.t.threat_id}><td className="code-font">{`> ${x.t.raw_input}`}</td><td>{x.t.threat_type.replaceAll('_', ' ')}</td><td className="code-font">{x.run ? x.run.experiment_type : '-'}</td><td>{x.run ? <span className={`badge ${x.run.result === 'Resilient' ? 'low' : 'high'}`}>{x.run.result}</span> : '-'}</td><td title="Time to return near baseline">{x.run ? `${x.run.recovery_time_secs}s` : '-'}</td></tr>)}{sessionTimeline.length === 0 && <tr><td colSpan="5" style={{ textAlign: 'center' }}>No threats for selected session.</td></tr>}</tbody></table></div>
         </div>}
 
         {activeTab === 'activity' && <div>
@@ -969,5 +892,96 @@ export default function App() {
         </div>
       )}
     </div>
+
+      {/* ── Session Investigation Modal ── */}
+      {selectedSessionDetail && (
+        <div style={{ position: 'fixed', top: 0, right: 0, width: 540, height: '100vh', background: 'rgba(6,8,18,0.98)', borderLeft: '1px solid var(--border-glass)', padding: 0, overflowY: 'auto', zIndex: 70, display: 'flex', flexDirection: 'column' }}>
+          {/* Header */}
+          <div style={{ padding: '16px 20px', borderBottom: '1px solid var(--border-glass)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'rgba(0,0,0,0.4)', position: 'sticky', top: 0, zIndex: 1 }}>
+            <div>
+              <h3 style={{ margin: 0, fontSize: '1rem', letterSpacing: 1 }}>Session Investigation</h3>
+              <span className="code-font" style={{ fontSize: 11, color: 'var(--text-secondary)' }}>{selectedSessionDetail.session?.session_id}</span>
+            </div>
+            <button className="nav-btn" onClick={() => setSelectedSessionDetail(null)}>✕ Close</button>
+          </div>
+
+          <div style={{ padding: '16px 20px', flex: 1 }}>
+            {sessionDetailLoading ? (
+              <p style={{ color: 'var(--text-secondary)' }}>Loading session data...</p>
+            ) : selectedSessionDetail.error ? (
+              <p style={{ color: 'var(--danger)' }}>{selectedSessionDetail.error}</p>
+            ) : (
+              <>
+                {/* Verdict Banner */}
+                {(() => {
+                  const verdict = selectedSessionDetail.summary?.verdict;
+                  const color = verdict === 'Suspicious' ? 'var(--danger)' : verdict === 'Monitored' ? 'var(--warning)' : 'var(--success)';
+                  return (
+                    <div style={{ background: `${color}22`, border: `1px solid ${color}`, borderRadius: 10, padding: '12px 16px', marginBottom: 16, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <span style={{ fontWeight: 700, fontSize: '1.1rem', color }}>Verdict: {verdict}</span>
+                      <div style={{ textAlign: 'right', fontSize: 12, color: 'var(--text-secondary)' }}>
+                        <div>🛡 Resilient: <strong style={{ color: 'var(--success)' }}>{selectedSessionDetail.summary?.resilient_count}</strong></div>
+                        <div>⚠ Vulnerable: <strong style={{ color: 'var(--danger)' }}>{selectedSessionDetail.summary?.vulnerable_count}</strong></div>
+                      </div>
+                    </div>
+                  );
+                })()}
+
+                {/* Session Metadata */}
+                <div className="panel" style={{ marginBottom: 14, padding: 14 }}>
+                  <h4 style={{ marginBottom: 10, color: 'var(--text-secondary)', fontSize: 12, letterSpacing: 1, textTransform: 'uppercase' }}>Session Metadata</h4>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, fontSize: 13 }}>
+                    <div><span style={{ color: 'var(--text-secondary)' }}>Source IP</span><br /><strong>{selectedSessionDetail.session?.source_ip}</strong></div>
+                    <div><span style={{ color: 'var(--text-secondary)' }}>Status</span><br /><span className={`badge ${selectedSessionDetail.session?.status === 'active' ? 'medium' : 'low'}`}>{selectedSessionDetail.session?.status}</span></div>
+                    <div><span style={{ color: 'var(--text-secondary)' }}>Logged In</span><br /><strong style={{ fontSize: 11 }}>{selectedSessionDetail.session?.start_time || '-'}</strong></div>
+                    <div><span style={{ color: 'var(--text-secondary)' }}>Logged Out</span><br /><strong style={{ fontSize: 11 }}>{selectedSessionDetail.session?.end_time || 'Still Active'}</strong></div>
+                    <div><span style={{ color: 'var(--text-secondary)' }}>Duration</span><br /><strong>{selectedSessionDetail.session?.duration_secs != null ? `${selectedSessionDetail.session.duration_secs}s` : '-'}</strong></div>
+                    <div><span style={{ color: 'var(--text-secondary)' }}>Total Commands</span><br /><strong>{selectedSessionDetail.summary?.total_commands}</strong></div>
+                  </div>
+                  {selectedSessionDetail.summary?.threat_types?.length > 0 && (
+                    <div style={{ marginTop: 10 }}>
+                      <span style={{ color: 'var(--text-secondary)', fontSize: 12 }}>Threat Types Seen: </span>
+                      {selectedSessionDetail.summary.threat_types.map(tt => (
+                        <span key={tt} className="badge high" style={{ marginRight: 4, marginTop: 4, display: 'inline-block' }}>{tt.replaceAll('_', ' ')}</span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* Command Timeline */}
+                <h4 style={{ marginBottom: 10, color: 'var(--text-secondary)', fontSize: 12, letterSpacing: 1, textTransform: 'uppercase' }}>Command Timeline</h4>
+                {(selectedSessionDetail.commands || []).map((cmd, idx) => (
+                  <div key={cmd.command_id} style={{ marginBottom: 10, borderRadius: 8, border: `1px solid ${cmd.chaos_result === 'Vulnerable' ? 'rgba(255,80,80,0.35)' : cmd.chaos_result === 'Resilient' ? 'rgba(0,255,160,0.2)' : 'var(--border-glass)'}`, background: 'rgba(255,255,255,0.02)', padding: '10px 14px' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                      <span style={{ fontSize: 11, color: 'var(--text-secondary)' }}>#{idx + 1} · {cmd.timestamp}</span>
+                      <div style={{ display: 'flex', gap: 6 }}>
+                        {cmd.threat_type !== 'None' && <span className="badge high" style={{ fontSize: 10 }}>{cmd.threat_type.replaceAll('_', ' ')}</span>}
+                        {cmd.chaos_result && <span className={`badge ${cmd.chaos_result === 'Resilient' ? 'low' : 'high'}`} style={{ fontSize: 10 }}>{cmd.chaos_result}</span>}
+                        {!cmd.chaos_result && cmd.threat_type === 'None' && <span className="badge low" style={{ fontSize: 10 }}>Normal</span>}
+                      </div>
+                    </div>
+                    <div className="code-font" style={{ fontSize: 13, marginBottom: 4 }}>&gt; {cmd.raw_input || '-'}</div>
+                    {cmd.threat_type !== 'None' && (
+                      <div style={{ fontSize: 11, color: 'var(--text-secondary)', display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+                        <span>Severity: <strong style={{ color: cmd.severity === 'High' || cmd.severity === 'Critical' ? 'var(--danger)' : 'var(--warning)' }}>{cmd.severity}</strong></span>
+                        <span>Confidence: <strong>{(cmd.confidence * 100).toFixed(0)}%</strong></span>
+                        <span>Source: <strong>{cmd.source}</strong></span>
+                        {cmd.experiment_type && <span>Test: <strong className="code-font">{cmd.experiment_type}</strong></span>}
+                        {cmd.chaos_result && <span>CPU Peak: <strong>{cmd.cpu_peak}%</strong></span>}
+                        {cmd.chaos_result && <span>Recovery: <strong>{cmd.recovery_time_secs}s</strong></span>}
+                        {cmd.intensity_level && <span>Intensity: <strong>Lv {cmd.intensity_level}</strong></span>}
+                      </div>
+                    )}
+                  </div>
+                ))}
+                {(!selectedSessionDetail.commands || selectedSessionDetail.commands.length === 0) && (
+                  <p style={{ color: 'var(--text-secondary)' }}>No commands recorded for this session.</p>
+                )}
+              </>
+            )}
+          </div>
+        </div>
+      )}
+    </>
   );
 }
