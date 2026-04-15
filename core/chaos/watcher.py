@@ -7,6 +7,7 @@ cross-session learning with structured JSON logs.
 
 import json
 import logging
+import random
 import threading
 import time
 from datetime import datetime, timezone
@@ -20,16 +21,23 @@ from core.adaptive.escalation import (
     update_session_metrics,
 )
 from core.chaos.experiments import (
+    DEFENSE_ACTIONS,
     CPU_VARIANTS,
     DEFAULT_SAFE_CONFIG,
     MAX_DURATION_SECS,
     MAX_INTENSITY,
+    SAFE_MODE,
     run_experiment,
     validate_experiment_config,
 )
 from core.chaos.threat_map import get_experiment_type, get_rule_based_experiment
 from core.database.db_client import get_connection, safe_execute
-from core.database.queries import get_threat_prediction, upsert_global_threat_stats
+from core.database.queries import (
+    get_defense_action_avg_scores,
+    get_threat_prediction,
+    insert_adaptive_defense_run,
+    upsert_global_threat_stats,
+)
 from core.intelligence.ai_classifier import generate_experiment_with_ai
 
 logger = logging.getLogger(__name__)
@@ -38,8 +46,13 @@ POLL_INTERVAL = 5
 DEBOUNCE_WINDOW_SECS = 2
 COMMAND_DEDUPE_WINDOW_SECS = 5
 EXPLORATION_DURATION_STEP = 30
+DEFENSE_EXPLORATION_PROB = 0.05
+DEFENSE_MIN_TRIES_PER_ACTION = 2
+DEFENSE_BOOTSTRAP_RUNS = 5
+NO_ACTION_PENALTY = 2.0
 last_processed_time = {}
 last_processed_command_time = {}
+best_config_by_threat = {}
 
 
 def _utc_now_iso():
@@ -160,7 +173,7 @@ def _has_non_generic_db_experiment(db_exp_type, db_exp_int, db_exp_dur):
 def _fetch_threat_history(threat_type: str, limit: int = 30):
     rows = safe_execute(
         """
-        SELECT cr.intensity_level, cr.duration_secs, cr.result, cr.recovery_time_secs, cr.notes, cr.cpu_peak
+        SELECT cr.intensity_level, cr.duration_secs, cr.result, cr.recovery_time_secs, cr.notes, cr.cpu_peak, cr.started_at
         FROM chaos_results cr
         JOIN threats t ON t.threat_id = cr.threat_id
         WHERE t.threat_type = ?
@@ -190,6 +203,7 @@ def _fetch_threat_history(threat_type: str, limit: int = 30):
                 "variant": variant,
                 "metric_source": metric_source,
                 "cpu_peak": float(r[5] or 0.0),
+                "started_at": r[6] or "",
             }
         )
     return history
@@ -218,6 +232,25 @@ def _tested_config_keys(history: list, exp_type: str) -> set:
         variant = h.get("variant", "") if exp_type == "cpu_stress" else ""
         keys.add((exp_type, int(h.get("intensity", 1)), int(h.get("duration", 5)), variant))
     return keys
+
+
+def _is_recent_duplicate(history: list, exp_type: str, intensity: int, duration: int, variant: str = "", window_secs: int = 30) -> bool:
+    now = datetime.now(timezone.utc)
+    target_variant = (variant or "").strip().lower() if exp_type == "cpu_stress" else ""
+    for h in history:
+        h_variant = (h.get("variant", "") or "").strip().lower() if exp_type == "cpu_stress" else ""
+        if (
+            int(h.get("intensity", 0) or 0) == int(intensity)
+            and int(h.get("duration", 0) or 0) == int(duration)
+            and h_variant == target_variant
+        ):
+            started_at = str(h.get("started_at", "") or "")
+            try:
+                seen = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+            except ValueError:
+                return True
+            return (now - seen).total_seconds() <= window_secs
+    return False
 
 
 def _failure_threshold(history: list):
@@ -304,7 +337,10 @@ def _all_configs_vulnerable(history: list, min_unique: int = 4) -> bool:
         groups.setdefault(key, []).append(h.get("result"))
     if len(groups) < min_unique:
         return False
-    return all(all(r == "Vulnerable" for r in results) for results in groups.values())
+    failure_rate = sum(1 for h in valid if str(h.get("result", "")) == "Vulnerable") / max(1, len(valid))
+    recent = valid[: min(10, len(valid))]
+    avg_recovery = sum(float(h.get("recovery", 0.0) or 0.0) for h in recent) / max(1, len(recent))
+    return failure_rate > 0.9 and avg_recovery > 2.0
 
 
 def _attach_learning_metrics(metrics: dict, config_meta: dict = None):
@@ -339,6 +375,133 @@ def _extract_note_value(notes: str, key: str):
     return segment.split(",", 1)[0].strip()
 
 
+def _compute_score(recovery_time: float, result: str, defense_action: str = "no_action") -> float:
+    score = float(recovery_time or 0.0) + (10.0 if str(result) == "Vulnerable" else 0.0)
+    if str(defense_action or "no_action") == "no_action":
+        score += NO_ACTION_PENALTY
+    return score
+def select_defense_action(threat_type: str) -> str:
+    scores = get_defense_action_avg_scores(threat_type)
+    action_order = {name: idx for idx, name in enumerate(DEFENSE_ACTIONS)}
+
+    # STEP 1: Ensure each action is tried once
+    for action in DEFENSE_ACTIONS:
+        if action not in scores:
+            _log_event(
+                "action_selected",
+                command="",
+                threat_type=threat_type,
+                source="bandit",
+                risk_score=0.0,
+                action=action,
+                mode="initial_explore"
+            )
+            return action
+
+    # STEP 2: Controlled exploration (only if needed)
+    under_tested = [
+        name for name in scores.keys()
+        if int(scores.get(name, {}).get("runs", 0)) < DEFENSE_MIN_TRIES_PER_ACTION
+    ]
+
+    if under_tested:
+        action = sorted(
+            under_tested,
+            key=lambda name: (
+                int(scores.get(name, {}).get("runs", 0)),
+                action_order.get(name, 999)
+            ),
+        )[0]
+
+        _log_event(
+            "action_selected",
+            command="",
+            threat_type=threat_type,
+            source="bandit",
+            risk_score=0.0,
+            action=action,
+            mode="force_explore",
+            runs=int(scores.get(action, {}).get("runs", 0)),
+        )
+        return action
+
+    # STEP 3: Filter out BAD actions and avoid repeated restart attempts
+    filtered_scores = {
+        k: v for k, v in scores.items()
+        if not (
+            k == "restart_container" and float(v.get("avg_score", 0)) > 11.0
+        )
+    }
+
+    if not filtered_scores:
+        filtered_scores = scores  # fallback
+
+    # STEP 4: Occasional exploration (safe)
+    if random.random() < 0.1:
+        action = random.choice(list(filtered_scores.keys()))
+        _log_event(
+            "action_selected",
+            command="",
+            threat_type=threat_type,
+            source="bandit",
+            risk_score=0.0,
+            action=action,
+            mode="explore"
+        )
+        return action
+
+    # STEP 5: Exploit BEST action
+    ranked = sorted(
+        filtered_scores.items(),
+        key=lambda kv: (
+            float(kv[1].get("avg_score", 9999.0))
+            + (NO_ACTION_PENALTY if kv[0] == "no_action" else 0.0)
+        ),
+    )
+
+    action, meta = ranked[0]
+
+    _log_event(
+        "action_selected",
+        command="",
+        threat_type=threat_type,
+        source="bandit",
+        risk_score=0.0,
+        action=action,
+        mode="exploit",
+        avg_score=round(float(meta.get("avg_score", 0.0)), 3),
+        runs=int(meta.get("runs", 0)),
+    )
+
+    return action
+
+
+def _remember_best_config(threat_type: str, config: dict, recovery_time: float, result: str):
+    score = float(recovery_time or 0.0) + (10.0 if str(result) == "Vulnerable" else 0.0)
+    prev = best_config_by_threat.get(threat_type)
+    if prev is None or score < float(prev.get("score", 9999.0)):
+        best_config_by_threat[threat_type] = {
+            "config": {
+                "type": config.get("type"),
+                "intensity": int(config.get("intensity", 1)),
+                "duration": int(config.get("duration", 5)),
+            },
+            "score": score,
+        }
+
+
+def _inject_best_config(threat_type: str, config: dict) -> dict:
+    remembered = best_config_by_threat.get(threat_type)
+    if not remembered:
+        return config
+    candidate = dict(config)
+    learned = remembered.get("config", {})
+    if learned.get("type") == candidate.get("type"):
+        candidate["intensity"] = int(learned.get("intensity", candidate.get("intensity", 1)))
+        candidate["duration"] = int(learned.get("duration", candidate.get("duration", 5)))
+    return validate_experiment_config(candidate)
+
+
 def _fetch_cpu_variant_history(threat_type: str, limit: int = 60):
     rows = safe_execute(
         """
@@ -364,6 +527,7 @@ def _fetch_cpu_variant_history(threat_type: str, limit: int = 60):
                 {
                     "variant": variant,
                     "result": result_str,
+                    "recovery": rec,
                     "score": rec + (10.0 if result_str == "Vulnerable" else 0.0),
                     "metric_source": metric_source,
                     "cpu_peak": float(cpu_peak or 0.0),
@@ -517,6 +681,25 @@ def _infer_target_service(command: str) -> str:
     return "generic"
 
 
+def _is_lightweight_recon_or_access(threat_type: str, command: str) -> bool:
+    t = str(threat_type or "")
+    c = " ".join(str(command or "").lower().split())
+    if t == "Sensitive_Data_Access":
+        return True
+    if t != "Reconnaissance":
+        return False
+    lightweight_tokens = (
+        "whoami",
+        "id",
+        "uname -a",
+        "hostname",
+        "ps aux",
+        "ps -ef",
+        "top",
+    )
+    return c in lightweight_tokens
+
+
 def _watcher_loop():
     _log_event("watcher_started", command="", threat_type="", source="watcher", risk_score=0.0)
 
@@ -545,6 +728,18 @@ def _watcher_loop():
                     )
                     continue
 
+                if _is_lightweight_recon_or_access(threat_type, command):
+                    _mark_threat_processed(threat_id)
+                    _log_event(
+                        "lightweight_threat_skip",
+                        command=command,
+                        threat_type=threat_type,
+                        source="watcher",
+                        risk_score=0.0,
+                        reason="recon_or_sensitive_access_no_heavy_chaos",
+                    )
+                    continue
+
                 check_and_reset_scaling(session_id, threat_type)
                 config, source = _resolve_experiment_config(
                     threat_type,
@@ -554,6 +749,7 @@ def _watcher_loop():
                     db_exp_int,
                     db_exp_dur,
                 )
+                config = _inject_best_config(threat_type, config)
                 prior_stats = get_threat_prediction(threat_type)
                 history = _fetch_threat_history(threat_type)
                 exploration_mode = _all_configs_vulnerable(history)
@@ -599,7 +795,7 @@ def _watcher_loop():
                         duration=int(config.get("duration", 5)),
                         instability_score=float(config.get("instability_score", 0.0) or 0.0),
                     )
-                variant_combination = bool(exploration_mode and config.get("type") == "cpu_stress")
+                variant_combination = bool((not SAFE_MODE) and exploration_mode and config.get("type") == "cpu_stress")
 
                 threshold = _failure_threshold(history)
                 if threshold is not None and int(config.get("intensity", 1)) > threshold + 1:
@@ -670,6 +866,7 @@ def _watcher_loop():
                             _mark_threat_processed(threat_id)
                             continue
 
+                defense_action = select_defense_action(threat_type)
                 logger.info(
                     json.dumps(
                         {
@@ -684,6 +881,7 @@ def _watcher_loop():
                             "cpu_variant": cpu_variant,
                             "variant_combination": variant_combination,
                             "target_service": target_service,
+                            "defense_action": defense_action,
                             "scaled": is_scaled,
                             "timestamp": _utc_now_iso(),
                         }
@@ -697,6 +895,7 @@ def _watcher_loop():
                     target_service,
                     cpu_variant,
                     variant_combination,
+                    defense_action,
                 )
                 metrics = _attach_learning_metrics(metrics, config)
                 if not _is_valid_metrics(metrics):
@@ -716,6 +915,28 @@ def _watcher_loop():
                 # Recovery is computed inside run_experiment and must complete
                 # before any critical decision is made.
                 recovery_time_secs = float(metrics.get("recovery_time_secs", 0.0) or 0.0)
+                primary_score = _compute_score(recovery_time_secs, metrics.get("result", "Resilient"), defense_action)
+                insert_adaptive_defense_run(
+                    threat_type=threat_type,
+                    experiment_type=config.get("type", "cpu_stress"),
+                    intensity_level=int(config.get("intensity", 1)),
+                    duration_secs=int(config.get("duration", 5)),
+                    variant=cpu_variant if config.get("type") == "cpu_stress" else "",
+                    defense_action=defense_action,
+                    recovery_time_secs=recovery_time_secs,
+                    result=metrics.get("result", "Resilient"),
+                    score=primary_score,
+                )
+                _log_event(
+                    "action_score",
+                    command=command,
+                    threat_type=threat_type,
+                    source="bandit",
+                    risk_score=0.0,
+                    action=defense_action,
+                    score=round(primary_score, 3),
+                )
+                _remember_best_config(threat_type, config, recovery_time_secs, metrics.get("result", "Resilient"))
 
                 is_failure = metrics.get("result") == "Vulnerable"
                 update_session_metrics(session_id, threat_type, is_failure)
@@ -778,7 +999,15 @@ def _watcher_loop():
                         if _all_configs_vulnerable(post_history):
                             retest_variant = _choose_exploration_cpu_variant(post_history, retest_variant)
                     retest_key = _config_key(retest_config, retest_variant if retest_config.get("type") == "cpu_stress" else "")
-                    if retest_key in _tested_config_keys(post_history, retest_config.get("type", "")):
+                    recent_duplicate = _is_recent_duplicate(
+                        post_history,
+                        retest_config.get("type", ""),
+                        int(retest_config.get("intensity", 1)),
+                        int(retest_config.get("duration", 5)),
+                        retest_variant if retest_config.get("type") == "cpu_stress" else "",
+                        window_secs=30,
+                    )
+                    if retest_key in _tested_config_keys(post_history, retest_config.get("type", "")) and recent_duplicate:
                         _log_event(
                             "retest_skip_duplicate",
                             command=command,
@@ -788,6 +1017,7 @@ def _watcher_loop():
                             experiment_type=retest_config["type"],
                         )
                     else:
+                        retest_defense_action = select_defense_action(threat_type)
                         _log_event(
                             "retest_start",
                             command=command,
@@ -799,6 +1029,7 @@ def _watcher_loop():
                             experiment_duration=retest_config["duration"],
                             cpu_variant=retest_variant,
                             target_service=target_service,
+                            defense_action=retest_defense_action,
                         )
                         retest_metrics = run_experiment(
                             retest_config["type"],
@@ -808,10 +1039,34 @@ def _watcher_loop():
                             target_service,
                             retest_variant,
                             variant_combination,
+                            retest_defense_action,
                         )
                         retest_metrics = _attach_learning_metrics(retest_metrics, retest_config)
                         if _is_valid_metrics(retest_metrics):
                             _insert_chaos_result(threat_id, retest_metrics, is_retest=True)
+                            retest_recovery = float(retest_metrics.get("recovery_time_secs", 0.0) or 0.0)
+                            retest_score = _compute_score(retest_recovery, retest_metrics.get("result", "Resilient"), retest_defense_action)
+                            insert_adaptive_defense_run(
+                                threat_type=threat_type,
+                                experiment_type=retest_config.get("type", "cpu_stress"),
+                                intensity_level=int(retest_config.get("intensity", 1)),
+                                duration_secs=int(retest_config.get("duration", 5)),
+                                variant=retest_variant if retest_config.get("type") == "cpu_stress" else "",
+                                defense_action=retest_defense_action,
+                                recovery_time_secs=retest_recovery,
+                                result=retest_metrics.get("result", "Resilient"),
+                                score=retest_score,
+                            )
+                            _log_event(
+                                "action_score",
+                                command=command,
+                                threat_type=threat_type,
+                                source="bandit",
+                                risk_score=stats["risk_score"],
+                                action=retest_defense_action,
+                                score=round(retest_score, 3),
+                            )
+                            _remember_best_config(threat_type, retest_config, retest_recovery, retest_metrics.get("result", "Resilient"))
                             _log_event(
                                 "retest_complete",
                                 command=command,
@@ -842,7 +1097,15 @@ def _watcher_loop():
                     if _all_configs_vulnerable(post_history):
                         next_variant = _choose_exploration_cpu_variant(variant_history, next_variant)
                     variant_key = _config_key(config, next_variant)
-                    if variant_key in _tested_config_keys(post_history, config.get("type", "")):
+                    recent_variant_duplicate = _is_recent_duplicate(
+                        post_history,
+                        config.get("type", ""),
+                        int(config.get("intensity", 1)),
+                        int(config.get("duration", 5)),
+                        next_variant,
+                        window_secs=30,
+                    )
+                    if variant_key in _tested_config_keys(post_history, config.get("type", "")) and recent_variant_duplicate:
                         _log_event(
                             "variant_retest_skip_duplicate",
                             command=command,
@@ -855,6 +1118,7 @@ def _watcher_loop():
                     if not next_variant:
                         pass
                     else:
+                        retest_defense_action = select_defense_action(threat_type)
                         _log_event(
                             "variant_retest_start",
                             command=command,
@@ -865,6 +1129,7 @@ def _watcher_loop():
                             experiment_intensity=config["intensity"],
                             experiment_duration=config["duration"],
                             cpu_variant=next_variant,
+                            defense_action=retest_defense_action,
                         )
                         retest_metrics = run_experiment(
                             config["type"],
@@ -873,11 +1138,35 @@ def _watcher_loop():
                             True,
                             target_service,
                             next_variant,
-                            True,
+                            variant_combination,
+                            retest_defense_action,
                         )
                         retest_metrics = _attach_learning_metrics(retest_metrics, config)
                         if _is_valid_metrics(retest_metrics):
                             _insert_chaos_result(threat_id, retest_metrics, is_retest=True)
+                            retest_recovery = float(retest_metrics.get("recovery_time_secs", 0.0) or 0.0)
+                            retest_score = _compute_score(retest_recovery, retest_metrics.get("result", "Resilient"), retest_defense_action)
+                            insert_adaptive_defense_run(
+                                threat_type=threat_type,
+                                experiment_type=config.get("type", "cpu_stress"),
+                                intensity_level=int(config.get("intensity", 1)),
+                                duration_secs=int(config.get("duration", 5)),
+                                variant=next_variant if config.get("type") == "cpu_stress" else "",
+                                defense_action=retest_defense_action,
+                                recovery_time_secs=retest_recovery,
+                                result=retest_metrics.get("result", "Resilient"),
+                                score=retest_score,
+                            )
+                            _log_event(
+                                "action_score",
+                                command=command,
+                                threat_type=threat_type,
+                                source="bandit",
+                                risk_score=stats["risk_score"],
+                                action=retest_defense_action,
+                                score=round(retest_score, 3),
+                            )
+                            _remember_best_config(threat_type, config, retest_recovery, retest_metrics.get("result", "Resilient"))
                             _log_event(
                                 "variant_retest_complete",
                                 command=command,
@@ -907,7 +1196,21 @@ def _watcher_loop():
                         and h.get("metric_source") != "unknown"
                         and float(h.get("cpu_peak", 0.0) or 0.0) > 0.0
                     }
-                    if len(failed_variants) == len(CPU_VARIANTS):
+                    recent_variant_runs = [
+                        h for h in _fetch_cpu_variant_history(threat_type)
+                        if h.get("result") == "Vulnerable"
+                        and h.get("variant") in CPU_VARIANTS
+                        and h.get("metric_source") != "unknown"
+                        and float(h.get("cpu_peak", 0.0) or 0.0) > 0.0
+                    ]
+                    avg_variant_recovery = (
+                        sum(float(h.get("recovery", 0.0) or 0.0) for h in recent_variant_runs[:10]) / max(1, len(recent_variant_runs[:10]))
+                    ) if recent_variant_runs else 0.0
+                    if (
+                        len(failed_variants) == len(CPU_VARIANTS)
+                        and float(stats.get("failure_rate", 0.0) or 0.0) > 0.9
+                        and avg_variant_recovery > 1.5
+                    ):
                         _log_event(
                             "severe_weakness_all_cpu_variants",
                             command=command,

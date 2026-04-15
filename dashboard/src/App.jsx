@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Activity, Server, Shield, Terminal, Zap } from 'lucide-react';
 
 const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000/api';
@@ -13,13 +13,27 @@ export default function App() {
   const [vulnerabilityMetrics, setVulnerabilityMetrics] = useState([]);
   const [criticalThreats, setCriticalThreats] = useState([]);
   const [learningInsights, setLearningInsights] = useState({ report: [], config_memory: [] });
+  const [defenseLearning, setDefenseLearning] = useState({ summary: [], recent: [] });
+  const [attackInsights, setAttackInsights] = useState({ top_commands: [], top_threat_types: [], top_experiment_types: [] });
+  const [maliciousActivity, setMaliciousActivity] = useState([]);
+  const [learningTransparency, setLearningTransparency] = useState([]);
+  const [sessionTimelineData, setSessionTimelineData] = useState([]);
+  const [sessionAnalysis, setSessionAnalysis] = useState(null);
+  const [sessionAnalysisLoading, setSessionAnalysisLoading] = useState(false);
   const [selectedSessionId, setSelectedSessionId] = useState(null);
+  const [overviewSection, setOverviewSection] = useState('core');
   const [selectedThreat, setSelectedThreat] = useState(null);
+  const [openExperimentId, setOpenExperimentId] = useState(null);
+  const [openExperiment, setOpenExperiment] = useState(null);
+  const [sessionPage, setSessionPage] = useState(1);
+  const sessionDetailRef = useRef(null);
   const [search, setSearch] = useState('');
   const [filterType, setFilterType] = useState('all');
   const [filterResult, setFilterResult] = useState('all');
   const [filterIntensity, setFilterIntensity] = useState('all');
   const [filterSource, setFilterSource] = useState('all');
+  const [filterSeverity, setFilterSeverity] = useState('all');
+  const [filterExperiment, setFilterExperiment] = useState('all');
   const [filterStatus, setFilterStatus] = useState('all');
   const [activitySessionFilter, setActivitySessionFilter] = useState('all');
   const [selectedActivity, setSelectedActivity] = useState(null);
@@ -29,7 +43,7 @@ export default function App() {
 
   const fetchData = async () => {
     try {
-      const [o, s, a, t, c, v, k, l] = await Promise.all([
+      const [o, s, a, t, c, v, k, l, d, bi, ma, lt] = await Promise.all([
         fetch(`${API_BASE}/overview`),
         fetch(`${API_BASE}/sessions`),
         fetch(`${API_BASE}/session_activity`),
@@ -38,11 +52,19 @@ export default function App() {
         fetch(`${API_BASE}/vulnerability_metrics`),
         fetch(`${API_BASE}/critical_threats`),
         fetch(`${API_BASE}/learning_insights`),
+        fetch(`${API_BASE}/defense_learning`),
+        fetch(`${API_BASE}/attack_behavior_insights`),
+        fetch(`${API_BASE}/malicious_activity`),
+        fetch(`${API_BASE}/learning_transparency`),
       ]);
-      if (![o, s, a, t, c, v, k, l].every((x) => x.ok)) throw new Error('non-200');
-      const [ov, ss, aa, tt, cc, vv, kk, ll] = await Promise.all([o.json(), s.json(), a.json(), t.json(), c.json(), v.json(), k.json(), l.json()]);
+      if (![o, s, a, t, c, v, k, l, d, bi, ma, lt].every((x) => x.ok)) throw new Error('non-200');
+      const [ov, ss, aa, tt, cc, vv, kk, ll, dd, bii, maa, ltt] = await Promise.all([o.json(), s.json(), a.json(), t.json(), c.json(), v.json(), k.json(), l.json(), d.json(), bi.json(), ma.json(), lt.json()]);
       setOverview(ov); setSessions(ss); setSessionActivity(aa); setThreats(tt); setChaosData(cc); setVulnerabilityMetrics(vv); setCriticalThreats(kk);
       setLearningInsights(ll || { report: [], config_memory: [] });
+      setDefenseLearning(dd || { summary: [], recent: [] });
+      setAttackInsights(bii || { top_commands: [], top_threat_types: [], top_experiment_types: [] });
+      setMaliciousActivity(maa || []);
+      setLearningTransparency(ltt || []);
       setApiError('');
     } catch {
       setApiError(`Cannot connect to API at ${API_BASE}. Start backend and refresh.`);
@@ -57,16 +79,82 @@ export default function App() {
     }
   }, [sessions, selectedSessionId]);
 
+  useEffect(() => {
+    setSessionPage(1);
+  }, [search, filterStatus, sessions]);
+
+  useEffect(() => {
+    if (activeTab === 'sessions' && sessionDetailRef.current) {
+      sessionDetailRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+  }, [selectedSessionId, activeTab]);
+
+  useEffect(() => {
+    if (activeTab !== 'chaos') {
+      setOpenExperimentId(null);
+      setOpenExperiment(null);
+    }
+  }, [activeTab]);
+
+  useEffect(() => {
+    const loadSessionTimeline = async () => {
+      if (!selectedSessionId) {
+        setSessionTimelineData([]);
+        return;
+      }
+      try {
+        const res = await fetch(`${API_BASE}/session/${selectedSessionId}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        setSessionTimelineData(Array.isArray(data) ? data : []);
+      } catch {
+        setSessionTimelineData([]);
+      }
+    };
+    loadSessionTimeline();
+  }, [selectedSessionId]);
+
+  const runSessionAnalysis = async () => {
+    if (!selectedSessionId) return;
+    setSessionAnalysisLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/session_analysis/${selectedSessionId}`, { method: 'POST' });
+      if (!res.ok) throw new Error('analysis_error');
+      const data = await res.json();
+      setSessionAnalysis(data || null);
+    } catch {
+      setSessionAnalysis({
+        attack_pattern: 'Analysis unavailable right now.',
+        attacker_intent: 'Unknown',
+        system_weakness: 'Unknown',
+        recommendation: 'Retry analysis after backend/API is stable.',
+      });
+    } finally {
+      setSessionAnalysisLoading(false);
+    }
+  };
+
+  const mappedTestForThreat = (t) => {
+    if (t.mapped_experiment_type) return t.mapped_experiment_type;
+    if (['Reconnaissance', 'Sensitive_Data_Access'].includes(t.threat_type)) return 'none';
+    return t.experiment_type || 'unknown';
+  };
+
   const filteredThreats = threats.filter((t) => {
     if (filterType !== 'all' && t.threat_type !== filterType) return false;
     if (filterSource !== 'all' && t.source !== filterSource) return false;
+    if (filterSeverity !== 'all' && String(t.severity || '').toLowerCase() !== String(filterSeverity).toLowerCase()) return false;
+    if (filterExperiment !== 'all' && mappedTestForThreat(t) !== filterExperiment) return false;
     if (search && !`${t.raw_input} ${t.threat_type}`.toLowerCase().includes(search.toLowerCase())) return false;
     return true;
   });
-  const filteredChaos = chaosData.filter((r) => {
+  const cleanedChaosData = chaosData.filter((r) => String(r.metric_source || '').toLowerCase() !== 'unknown');
+  const filteredChaos = cleanedChaosData.filter((r) => {
     if (filterType !== 'all' && r.threat_type !== filterType) return false;
     if (filterResult !== 'all' && r.result !== filterResult) return false;
     if (filterIntensity !== 'all' && Number(r.intensity_level) !== Number(filterIntensity)) return false;
+    if (filterSeverity !== 'all' && String(r.severity || '').toLowerCase() !== String(filterSeverity).toLowerCase()) return false;
+    if (filterExperiment !== 'all' && r.experiment_type !== filterExperiment) return false;
     if (search && !`${r.raw_input} ${r.threat_type} ${r.experiment_type}`.toLowerCase().includes(search.toLowerCase())) return false;
     return true;
   });
@@ -75,9 +163,14 @@ export default function App() {
     if (search && !`${s.session_id} ${s.source_ip}`.toLowerCase().includes(search.toLowerCase())) return false;
     return true;
   });
+  const SESSIONS_PER_PAGE = 8;
+  const sessionPageCount = Math.max(1, Math.ceil(filteredSessions.length / SESSIONS_PER_PAGE));
+  const paginatedSessions = filteredSessions.slice((sessionPage - 1) * SESSIONS_PER_PAGE, sessionPage * SESSIONS_PER_PAGE);
   const filteredActivity = sessionActivity.filter((x) => {
     if (activitySessionFilter !== 'all' && x.session_id !== activitySessionFilter) return false;
     if (search && !`${x.raw_input} ${x.threat_type} ${x.result} ${x.session_id}`.toLowerCase().includes(search.toLowerCase())) return false;
+    const commandText = String(x.raw_input || '').replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '').trim();
+    if (!x.threat_id && !x.result && commandText.length <= 1) return false;
     return true;
   });
   const activityCommandText = (raw) => String(raw || '').replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '').trim();
@@ -85,19 +178,39 @@ export default function App() {
     ? chaosData.filter((r) => Number(r.threat_id) === Number(selectedActivity.threat_id)).sort((a, b) => Number(a.experiment_id) - Number(b.experiment_id))
     : [];
 
+  const handleExperimentClick = (run) => {
+    if (openExperimentId === run.experiment_id) {
+      setOpenExperimentId(null);
+      setOpenExperiment(null);
+    } else {
+      setOpenExperimentId(run.experiment_id);
+      setOpenExperiment(run);
+    }
+  };
+
+  const getExperimentRecommendation = (run) => {
+    if (!run || !learningInsights.config_memory) return null;
+    const best = learningInsights.config_memory.find((cfg) => cfg.threat_type === run.threat_type && cfg.experiment_type === run.experiment_type);
+    return best ? configSettingsText(best) : null;
+  };
+
   const topRisk = vulnerabilityMetrics[0];
   const failureRatePct = topRisk ? Math.round(Number(topRisk.failure_rate || 0) * 100) : 0;
   const systemRisk = failureRatePct >= 80 ? 'HIGH' : failureRatePct >= 45 ? 'MEDIUM' : 'LOW';
-  const vulnerableRuns = chaosData.filter((x) => x.result === 'Vulnerable');
-  const avgRecovery = chaosData.length ? chaosData.reduce((a, b) => a + Number(b.recovery_time_secs || 0), 0) / chaosData.length : 0;
-  const worstRecovery = chaosData.length ? Math.max(...chaosData.map((x) => Number(x.recovery_time_secs || 0))) : 0;
-  const avgIntensity = chaosData.length ? chaosData.reduce((a, b) => a + Number(b.intensity_level || 1), 0) / chaosData.length : 1;
-  const failRate = chaosData.length ? vulnerableRuns.length / chaosData.length : 0;
+  const vulnerableRuns = cleanedChaosData.filter((x) => x.result === 'Vulnerable');
+  const avgRecovery = cleanedChaosData.length ? cleanedChaosData.reduce((a, b) => a + Number(b.recovery_time_secs || 0), 0) / cleanedChaosData.length : 0;
+  const worstRecovery = cleanedChaosData.length ? Math.max(...cleanedChaosData.map((x) => Number(x.recovery_time_secs || 0))) : 0;
+  const avgIntensity = cleanedChaosData.length ? cleanedChaosData.reduce((a, b) => a + Number(b.intensity_level || 1), 0) / cleanedChaosData.length : 1;
+  const failRate = cleanedChaosData.length ? vulnerableRuns.length / cleanedChaosData.length : 0;
   const healthScore = Math.max(0, Math.min(100, Math.round(100 - failRate * 60 - Math.min(worstRecovery, 30) * 1.2 - Math.min(avgIntensity, 6) * 4)));
 
   const sourceBreakdown = threats.reduce((a, t) => ({ ...a, [t.source === 'ai' ? 'ai' : 'rule']: (a[t.source === 'ai' ? 'ai' : 'rule'] || 0) + 1 }), { ai: 0, rule: 0 });
   const topThreatClasses = Object.entries(threats.reduce((a, t) => { a[t.threat_type] = (a[t.threat_type] || 0) + 1; return a; }, {})).sort((a, b) => b[1] - a[1]).slice(0, 4);
   const uniqueThreatTypes = Array.from(new Set(threats.map((t) => t.threat_type))).sort();
+  const uniqueExperimentTypes = Array.from(new Set([
+    ...threats.map((t) => mappedTestForThreat(t)),
+    ...chaosData.map((r) => r.experiment_type),
+  ].filter(Boolean))).sort();
 
   const orderedChaos = filteredChaos.slice().sort((a, b) => Number(a.experiment_id) - Number(b.experiment_id));
   const recoverySeries = orderedChaos.map((x) => Number(x.recovery_time_secs || 0));
@@ -191,8 +304,38 @@ export default function App() {
   }, {})).map(([k, s]) => ({ threat: k, score: Math.round(((s.f / Math.max(1, s.t)) * (s.r / Math.max(1, s.t)) * (s.i / Math.max(1, s.t))) * 100) })).sort((a, b) => b.score - a.score).slice(0, 6);
   const explorationReport = learningInsights.report || [];
   const configMemory = learningInsights.config_memory || [];
+  const defenseSummary = defenseLearning.summary || [];
+  const defenseRecent = defenseLearning.recent || [];
+  const recoveryByThreat = {};
+  const recoveryByExperimentType = {};
+  [...filteredChaos].sort((a, b) => Number(a.experiment_id) - Number(b.experiment_id)).forEach((r) => {
+    const key = `${r.threat_id}:${r.experiment_type}`;
+    const prev = recoveryByThreat[key] || [];
+    prev.push(Number(r.recovery_time_secs || 0));
+    recoveryByThreat[key] = prev;
+    const typePrev = recoveryByExperimentType[r.experiment_type] || [];
+    typePrev.push(Number(r.recovery_time_secs || 0));
+    recoveryByExperimentType[r.experiment_type] = typePrev;
+  });
+  const beforeAfterText = (row) => {
+    const key = `${row.threat_id}:${row.experiment_type}`;
+    const series = recoveryByThreat[key] || [];
+    const after = Number(row.recovery_time_secs || 0);
+    let before = null;
+    if (series.length >= 2) {
+      before = series[series.length - 2];
+    } else {
+      const fallback = recoveryByExperimentType[row.experiment_type] || [];
+      if (fallback.length >= 2) before = fallback[fallback.length - 2];
+    }
+    if (before == null) return `Before: ${after.toFixed(2)}s | After: ${after.toFixed(2)}s`;
+    return `Before: ${before.toFixed(2)}s | After: ${after.toFixed(2)}s`;
+  };
 
   const selectedSession = sessions.find((s) => s.session_id === selectedSessionId) || sessions[0];
+  const selectedSessionCommands = sessionActivity
+    .filter((x) => selectedSession && x.session_id === selectedSession.session_id)
+    .sort((a, b) => String(a.timestamp || '').localeCompare(String(b.timestamp || '')));
   const sessionTimeline = threats.filter((t) => selectedSession && t.session_id === selectedSession.session_id).map((t) => {
     const run = chaosData.filter((r) => r.threat_id === t.threat_id).sort((a, b) => Number(a.experiment_id) - Number(b.experiment_id)).pop();
     return { t, run };
@@ -292,9 +435,19 @@ export default function App() {
               </div>
             )}
             {activeTab === 'threats' && (
-              <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr 1fr', gap: 10 }}>
+              <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr 1fr 1fr 1fr', gap: 10 }}>
                 <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search command / class / severity" style={{ background: 'rgba(255,255,255,0.04)', border: '1px solid var(--border-glass)', color: 'var(--text-primary)', padding: 10, borderRadius: 8 }} />
                 <select value={filterType} onChange={(e) => setFilterType(e.target.value)} style={{ background: 'rgba(255,255,255,0.04)', border: '1px solid var(--border-glass)', color: 'var(--text-primary)', padding: 10, borderRadius: 8 }}><option value="all">All Threat Types</option>{uniqueThreatTypes.map((tt) => <option key={tt} value={tt}>{tt.replaceAll('_', ' ')}</option>)}</select>
+                <select value={filterSeverity} onChange={(e) => setFilterSeverity(e.target.value)} style={{ background: 'rgba(255,255,255,0.04)', border: '1px solid var(--border-glass)', color: 'var(--text-primary)', padding: 10, borderRadius: 8 }}>
+                  <option value="all">All Severities</option>
+                  <option value="Low">Low</option>
+                  <option value="Medium">Medium</option>
+                  <option value="High">High</option>
+                </select>
+                <select value={filterExperiment} onChange={(e) => setFilterExperiment(e.target.value)} style={{ background: 'rgba(255,255,255,0.04)', border: '1px solid var(--border-glass)', color: 'var(--text-primary)', padding: 10, borderRadius: 8 }}>
+                  <option value="all">All Experiments</option>
+                  {uniqueExperimentTypes.map((et) => <option key={et} value={et}>{et}</option>)}
+                </select>
                 <select value={filterSource} onChange={(e) => setFilterSource(e.target.value)} style={{ background: 'rgba(255,255,255,0.04)', border: '1px solid var(--border-glass)', color: 'var(--text-primary)', padding: 10, borderRadius: 8 }}>
                   <option value="all">All Sources</option>
                   <option value="ai">AI Model</option>
@@ -303,11 +456,21 @@ export default function App() {
               </div>
             )}
             {activeTab === 'chaos' && (
-              <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr 1fr 1fr', gap: 10 }}>
+              <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr 1fr 1fr 1fr 1fr', gap: 10 }}>
                 <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search command / threat / experiment" style={{ background: 'rgba(255,255,255,0.04)', border: '1px solid var(--border-glass)', color: 'var(--text-primary)', padding: 10, borderRadius: 8 }} />
                 <select value={filterType} onChange={(e) => setFilterType(e.target.value)} style={{ background: 'rgba(255,255,255,0.04)', border: '1px solid var(--border-glass)', color: 'var(--text-primary)', padding: 10, borderRadius: 8 }}><option value="all">All Threat Types</option>{uniqueThreatTypes.map((tt) => <option key={tt} value={tt}>{tt.replaceAll('_', ' ')}</option>)}</select>
                 <select value={filterResult} onChange={(e) => setFilterResult(e.target.value)} style={{ background: 'rgba(255,255,255,0.04)', border: '1px solid var(--border-glass)', color: 'var(--text-primary)', padding: 10, borderRadius: 8 }}><option value="all">All Results</option><option value="Vulnerable">Vulnerable</option><option value="Resilient">Resilient</option></select>
                 <select value={filterIntensity} onChange={(e) => setFilterIntensity(e.target.value)} style={{ background: 'rgba(255,255,255,0.04)', border: '1px solid var(--border-glass)', color: 'var(--text-primary)', padding: 10, borderRadius: 8 }}><option value="all">All Intensities</option><option value="1">Lv 1</option><option value="2">Lv 2</option><option value="3">Lv 3</option><option value="4">Lv 4</option><option value="5">Lv 5</option><option value="6">Lv 6</option></select>
+                <select value={filterSeverity} onChange={(e) => setFilterSeverity(e.target.value)} style={{ background: 'rgba(255,255,255,0.04)', border: '1px solid var(--border-glass)', color: 'var(--text-primary)', padding: 10, borderRadius: 8 }}>
+                  <option value="all">All Severities</option>
+                  <option value="Low">Low</option>
+                  <option value="Medium">Medium</option>
+                  <option value="High">High</option>
+                </select>
+                <select value={filterExperiment} onChange={(e) => setFilterExperiment(e.target.value)} style={{ background: 'rgba(255,255,255,0.04)', border: '1px solid var(--border-glass)', color: 'var(--text-primary)', padding: 10, borderRadius: 8 }}>
+                  <option value="all">All Experiments</option>
+                  {uniqueExperimentTypes.map((et) => <option key={et} value={et}>{et}</option>)}
+                </select>
               </div>
             )}
           </div>
@@ -316,6 +479,13 @@ export default function App() {
 
         {activeTab === 'overview' && <div>
           <h1 style={{ marginBottom: 24, fontWeight: 300, fontSize: '2rem' }}>System Overview</h1>
+          <div className="panel" style={{ marginBottom: 20, display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+            <button className={`nav-btn ${overviewSection === 'core' ? 'active' : ''}`} onClick={() => setOverviewSection('core')}>Core Metrics</button>
+            <button className={`nav-btn ${overviewSection === 'risk' ? 'active' : ''}`} onClick={() => setOverviewSection('risk')}>Risk Insights</button>
+            <button className={`nav-btn ${overviewSection === 'learning' ? 'active' : ''}`} onClick={() => setOverviewSection('learning')}>Learning & Behavior</button>
+          </div>
+          {overviewSection === 'core' && (
+            <>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 20, marginBottom: 20 }}><div className="panel"><div style={{ color: 'var(--text-secondary)' }}>Sessions</div><div className="stat-value">{overview.total_sessions}</div></div><div className="panel"><div style={{ color: 'var(--text-secondary)' }}>Threats</div><div className="stat-value">{overview.total_threats}</div></div><div className="panel"><div style={{ color: 'var(--text-secondary)' }}>Vulnerable Runs</div><div className="stat-value">{overview.vulnerable_runs}</div></div></div>
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20 }}>
             <div className="panel"><h3 style={{ marginBottom: 12, color: 'var(--text-secondary)' }}>Detection Source Mix</h3><p>Rule Engine: <strong>{sourceBreakdown.rule}</strong></p><p>AI Model: <strong>{sourceBreakdown.ai}</strong></p></div>
@@ -328,6 +498,9 @@ export default function App() {
           <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 20, marginTop: 20 }}>
             <div className="panel"><h3 style={{ marginBottom: 12, color: 'var(--text-secondary)' }}>Intensity to Avg Recovery Trend</h3>{renderLineChart(linePts(intensityRecoverySeries), 'var(--warning)', 'Avg Recovery (s)', 'Intensity Bucket', `${Math.max(...intensityRecoverySeries, 0).toFixed(2)}s`, '0s')}<p style={{ marginTop: 8, color: 'var(--text-secondary)' }}>{intensityLevels.length ? intensityLevels.map((lvl, i) => `Lv ${lvl}: ${intensityRecoverySeries[i].toFixed(2)}s`).join(' | ') : 'No intensity trend data yet.'}</p></div>
           </div>
+            </>
+          )}
+          {overviewSection === 'risk' && (
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20, marginTop: 20 }}>
             <div className="panel">
               <h3 style={{ marginBottom: 12, color: 'var(--text-secondary)' }}>Top Failing Commands</h3>
@@ -386,6 +559,9 @@ export default function App() {
               )}
             </div>
           </div>
+          )}
+          {overviewSection === 'learning' && (
+            <>
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20, marginTop: 20 }}>
             <div className="panel">
               <h3 style={{ marginBottom: 12, color: 'var(--text-secondary)' }}>Exploration Report</h3>
@@ -439,12 +615,192 @@ export default function App() {
               </table>
             </div>
           </div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20, marginTop: 20 }}>
+            <div className="panel">
+              <h3 style={{ marginBottom: 12, color: 'var(--text-secondary)' }}>Adaptive Defense Actions</h3>
+              {defenseSummary.slice(0, 8).map((s) => (
+                <div key={s.threat_type} style={{ marginBottom: 10, paddingBottom: 8, borderBottom: '1px dashed var(--border-glass)' }}>
+                  <p><strong>{s.threat_type.replaceAll('_', ' ')}</strong></p>
+                  <p style={{ color: 'var(--text-secondary)' }}>
+                    {`Best: ${s.best_action?.action || 'no_action'} (${Number(s.best_action?.avg_recovery || 0).toFixed(2)}s)`}
+                  </p>
+                  <p style={{ color: 'var(--text-secondary)' }}>
+                    {`Worst: ${(s.actions && s.actions.length ? s.actions[s.actions.length - 1].action : 'n/a')} (${Number(s.actions && s.actions.length ? s.actions[s.actions.length - 1].avg_recovery : 0).toFixed(2)}s)`}
+                  </p>
+                  <p style={{ color: 'var(--text-secondary)' }}>
+                    Best Action: <span className="code-font">{s.best_action?.action || 'no_action'}</span> | Avg Score: {Number(s.best_action?.avg_score || 0).toFixed(2)} | Runs: {s.best_action?.runs || 0}
+                  </p>
+                  <p style={{ color: 'var(--text-secondary)' }}>{s.decision_reason}</p>
+                </div>
+              ))}
+              {defenseSummary.length === 0 && <p>No defense learning data yet.</p>}
+            </div>
+            <div className="panel">
+              <h3 style={{ marginBottom: 12, color: 'var(--text-secondary)' }}>Recent Defense Learning Runs</h3>
+              {defenseRecent.slice(0, 8).map((r) => (
+                <p key={r.run_id} className="code-font">{`#${r.run_id} ${r.threat_type} ${r.experiment_type} Lv${r.intensity_level} action=${r.defense_action} -> ${r.result} (${r.recovery_time_secs}s, score=${r.score})`}</p>
+              ))}
+              {defenseRecent.length === 0 && <p>No defense runs logged yet.</p>}
+            </div>
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20, marginTop: 20 }}>
+            <div className="panel">
+              <h3 style={{ marginBottom: 12, color: 'var(--text-secondary)' }}>Attack Behavior Insights</h3>
+              <p style={{ color: 'var(--text-secondary)' }}>Top Commands</p>
+              {(attackInsights.top_commands || []).slice(0, 5).map((x, i) => <p key={`tc-${i}`} className="code-font">{`${x.command} (${x.count})`}</p>)}
+              <p style={{ color: 'var(--text-secondary)', marginTop: 10 }}>Top Threat Types</p>
+              {(attackInsights.top_threat_types || []).slice(0, 5).map((x, i) => <p key={`tt-${i}`}>{`${String(x.threat_type || '').replaceAll('_', ' ')} (${x.count})`}</p>)}
+              <p style={{ color: 'var(--text-secondary)', marginTop: 10 }}>Most Used Experiments</p>
+              {(attackInsights.top_experiment_types || []).slice(0, 5).map((x, i) => <p key={`te-${i}`} className="code-font">{`${x.experiment_type} (${x.count})`}</p>)}
+            </div>
+            <div className="panel">
+              <h3 style={{ marginBottom: 12, color: 'var(--text-secondary)' }}>Malicious Activity</h3>
+              {(maliciousActivity || []).slice(0, 10).map((x, i) => (
+                <p key={`ma-${i}`}>
+                  <span className="badge medium" style={{ marginRight: 8 }}>{x.category}</span>
+                  <span className="code-font">{x.command}</span>
+                  {` (${x.count})`}
+                </p>
+              ))}
+              {(!maliciousActivity || maliciousActivity.length === 0) && <p>No suspicious pattern hits yet.</p>}
+            </div>
+          </div>
+          <div className="panel" style={{ marginTop: 20 }}>
+            <h3 style={{ marginBottom: 12, color: 'var(--text-secondary)' }}>Learning Transparency</h3>
+            <table>
+              <thead>
+                <tr>
+                  <th>Defense Action</th>
+                  <th>Average Score</th>
+                  <th>Runs</th>
+                </tr>
+              </thead>
+              <tbody>
+                {learningTransparency.map((x) => (
+                  <tr key={x.defense_action}>
+                    <td className="code-font">{x.defense_action}</td>
+                    <td>{Number(x.avg_score || 0).toFixed(2)}</td>
+                    <td>{x.runs}</td>
+                  </tr>
+                ))}
+                {learningTransparency.length === 0 && <tr><td colSpan="3" style={{ textAlign: 'center' }}>No learning transparency data yet.</td></tr>}
+              </tbody>
+            </table>
+          </div>
+            </>
+          )}
         </div>}
 
         {activeTab === 'sessions' && <div>
           <h1 style={{ marginBottom: 24, fontWeight: 300, fontSize: '2rem' }}>Session Activity</h1>
-          <div className="panel"><table><thead><tr><th>Session ID</th><th>Source IP</th><th>Start Time</th><th>Commands</th><th>Status</th></tr></thead><tbody>{filteredSessions.map((s) => <tr key={s.session_id} style={{ cursor: 'pointer', outline: selectedSessionId === s.session_id ? '1px solid var(--accent-cyan)' : 'none' }} onClick={() => setSelectedSessionId(s.session_id)}><td className="code-font">{s.session_id}</td><td>{s.source_ip}</td><td>{s.start_time}</td><td>{s.total_commands}</td><td><span className={`badge ${s.status === 'active' ? 'medium' : 'low'}`}>{s.status}</span></td></tr>)}{filteredSessions.length === 0 && <tr><td colSpan="5" style={{ textAlign: 'center' }}>No sessions match current filter.</td></tr>}</tbody></table></div>
-          <div className="panel" style={{ marginTop: 20 }}><h3 style={{ marginBottom: 12, color: 'var(--text-secondary)' }}>Session Drilldown Timeline</h3><table><thead><tr><th>Command</th><th>Threat</th><th>Experiment</th><th>Result</th><th>Recovery</th></tr></thead><tbody>{sessionTimeline.map((x) => <tr key={x.t.threat_id}><td className="code-font">{`> ${x.t.raw_input}`}</td><td>{x.t.threat_type.replaceAll('_', ' ')}</td><td className="code-font">{x.run ? x.run.experiment_type : '-'}</td><td>{x.run ? <span className={`badge ${x.run.result === 'Resilient' ? 'low' : 'high'}`}>{x.run.result}</span> : '-'}</td><td title="Time to return near baseline">{x.run ? `${x.run.recovery_time_secs}s` : '-'}</td></tr>)}{sessionTimeline.length === 0 && <tr><td colSpan="5" style={{ textAlign: 'center' }}>No threats for selected session.</td></tr>}</tbody></table></div>
+          <div className="panel">
+            <table>
+              <thead>
+                <tr>
+                  <th>Session ID</th>
+                  <th>Source IP</th>
+                  <th>Start Time</th>
+                  <th>Commands</th>
+                  <th>Top Threat</th>
+                  <th>Failure Rate</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {paginatedSessions.map((s) => (
+                  <tr key={s.session_id} style={{ cursor: 'pointer', outline: selectedSessionId === s.session_id ? '1px solid var(--accent-cyan)' : 'none' }} onClick={() => { setSelectedSessionId(s.session_id); setSessionAnalysis(null); }}>
+                    <td className="code-font">{s.session_id}</td>
+                    <td>{s.source_ip}</td>
+                    <td>{s.start_time}</td>
+                    <td>{s.total_commands}</td>
+                    <td>{String(s.top_threat || 'None').replaceAll('_', ' ')}</td>
+                    <td>{`${Math.round(Number(s.failure_rate || 0) * 100)}%`}</td>
+                    <td><span className={`badge ${s.status === 'active' ? 'medium' : 'low'}`}>{s.status}</span></td>
+                  </tr>
+                ))}
+                {paginatedSessions.length === 0 && <tr><td colSpan="7" style={{ textAlign: 'center' }}>No sessions match current filter.</td></tr>}
+              </tbody>
+            </table>
+          </div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, marginTop: 10 }}>
+            <button className="nav-btn" onClick={() => setSessionPage(Math.max(1, sessionPage - 1))} disabled={sessionPage <= 1}>Previous</button>
+            <div style={{ color: 'var(--text-secondary)' }}>Page {sessionPage} of {sessionPageCount}</div>
+            <button className="nav-btn" onClick={() => setSessionPage(Math.min(sessionPageCount, sessionPage + 1))} disabled={sessionPage >= sessionPageCount}>Next</button>
+          </div>
+          <div className="panel" ref={sessionDetailRef} style={{ marginTop: 20 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+              <h3 style={{ marginBottom: 0, color: 'var(--text-secondary)' }}>Session-wise Commands</h3>
+              <button className="nav-btn" style={{ padding: '4px 10px' }} onClick={() => { setSelectedSessionId(null); setSessionAnalysis(null); }}>{'Close details'}</button>
+            </div>
+            <table>
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Command</th>
+                  <th>Class</th>
+                  <th>Mapped Test</th>
+                  <th>Outcome</th>
+                </tr>
+              </thead>
+              <tbody>
+                {selectedSessionCommands.map((cmd) => (
+                  <tr key={`sess-cmd-${cmd.command_id}`}>
+                    <td>{cmd.timestamp}</td>
+                    <td className="code-font">{`> ${activityCommandText(cmd.raw_input) || cmd.raw_input}`}</td>
+                    <td>{cmd.threat_id ? `${cmd.threat_type.replaceAll('_', ' ')} (${cmd.severity || 'Low'})` : 'No Threat'}</td>
+                    <td className="code-font">{cmd.experiment_type || '-'}</td>
+                    <td>
+                      {cmd.result ? (
+                        <span className={`badge ${cmd.result === 'Resilient' ? 'low' : 'high'}`}>{cmd.result}</span>
+                      ) : (
+                        <span style={{ color: 'var(--text-secondary)' }}>-</span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+                {selectedSessionCommands.length === 0 && <tr><td colSpan="5" style={{ textAlign: 'center' }}>No commands for selected session.</td></tr>}
+              </tbody>
+            </table>
+          </div>
+
+          <div className="panel" style={{ marginTop: 20 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+              <h3 style={{ color: 'var(--text-secondary)' }}>Session Timeline Detail</h3>
+              <button className="nav-btn" onClick={runSessionAnalysis} disabled={!selectedSessionId || sessionAnalysisLoading}>
+                {sessionAnalysisLoading ? 'Analyzing...' : 'Run AI Session Analysis'}
+              </button>
+            </div>
+            {sessionTimelineData.map((step, idx) => (
+              <div key={`${step.command_id}-${step.threat_id}-${idx}`} style={{ padding: 12, marginBottom: 10, border: '1px solid var(--border-glass)', borderRadius: 10, background: 'rgba(255,255,255,0.02)' }}>
+                <p><strong>{`${idx + 1}.`}</strong> <span className="code-font">{step.command || '-'}</span></p>
+                <p>{`\u2193 Threat: ${String(step.threat_type || 'Unknown').replaceAll('_', ' ')} (${step.severity || 'Low'})`}</p>
+                <p>{`\u2193 Defense: ${step.defense_action || 'no_action'}`}</p>
+                <p>{`\u2193 Recovery: ${Number(step.recovery_time_secs || 0).toFixed(2)}s`}</p>
+                <p>
+                  {`\u2193 Result: `}
+                  <span className={`badge ${step.result === 'Resilient' ? 'low' : step.outcome_state === 'Degraded' ? 'medium' : 'high'}`}>
+                    {step.outcome_state || step.result || (step.experiment_type ? 'Pending' : 'Skipped')}
+                  </span>
+                  {!step.experiment_type && ' (lightweight/no chaos)'}
+                </p>
+              </div>
+            ))}
+            {sessionTimelineData.length === 0 && <p>No timeline data for selected session.</p>}
+          </div>
+
+          <div className="panel" style={{ marginTop: 20 }}>
+            <h3 style={{ marginBottom: 12, color: 'var(--text-secondary)' }}>AI Session Analysis</h3>
+            {sessionAnalysis ? (
+              <>
+                <p><strong>Attack Pattern:</strong> {sessionAnalysis.attack_pattern}</p>
+                <p><strong>Attacker Intent:</strong> {sessionAnalysis.attacker_intent}</p>
+                <p><strong>System Weakness:</strong> {sessionAnalysis.system_weakness}</p>
+                <p><strong>Recommendation:</strong> {sessionAnalysis.recommendation}</p>
+              </>
+            ) : (
+              <p>Select a session and click "Run AI Session Analysis".</p>
+            )}
+          </div>
         </div>}
 
         {activeTab === 'activity' && <div>
@@ -517,14 +873,42 @@ export default function App() {
 
         {activeTab === 'threats' && <div>
           <h1 style={{ marginBottom: 24, fontWeight: 300, fontSize: '2rem' }}>Live Threat Feed</h1>
-          <div className="panel"><table><thead><tr><th>Class</th><th>Severity</th><th>Confidence</th><th>Mapped Test</th><th>Raw Command</th><th>Source</th></tr></thead><tbody>{filteredThreats.map((t) => <tr key={t.threat_id} style={{ cursor: 'pointer' }} onClick={() => setSelectedThreat(t)}><td style={{ fontWeight: 600 }}>{t.threat_type.replaceAll('_', ' ')}</td><td><span className={`badge ${String(t.severity || '').toLowerCase()}`}>{t.severity}</span></td><td>{Number(t.confidence || 0).toFixed(2)}</td><td className="code-font">{t.mapped_experiment_type || t.experiment_type}</td><td className="code-font">{`> ${t.raw_input}`}</td><td>{t.source === 'ai' ? 'AI Model' : 'Rule Engine'}</td></tr>)}{filteredThreats.length === 0 && <tr><td colSpan="6" style={{ textAlign: 'center' }}>Listening on port 2222...</td></tr>}</tbody></table></div>
+          <div className="panel"><table><thead><tr><th>Class</th><th>Severity</th><th>Confidence</th><th>Mapped Test</th><th>Raw Command</th><th>Source</th></tr></thead><tbody>{filteredThreats.map((t) => <tr key={t.threat_id} style={{ cursor: 'pointer' }} onClick={() => setSelectedThreat(t)}><td style={{ fontWeight: 600 }}>{t.threat_type.replaceAll('_', ' ')}</td><td><span className={`badge ${String(t.severity || '').toLowerCase()}`}>{t.severity}</span></td><td>{Number(t.confidence || 0).toFixed(2)}</td><td className="code-font">{mappedTestForThreat(t)}</td><td className="code-font">{`> ${t.raw_input}`}</td><td>{t.source === 'ai' ? 'AI Model' : 'Rule Engine'}</td></tr>)}{filteredThreats.length === 0 && <tr><td colSpan="6" style={{ textAlign: 'center' }}>Listening on port 2222...</td></tr>}</tbody></table></div>
         </div>}
 
         {activeTab === 'chaos' && <div>
           <h1 style={{ marginBottom: 24, fontWeight: 300, fontSize: '2rem' }}>Chaos & Risk</h1>
-          <div className="panel"><table><thead><tr><th>Experiment ID</th><th>Threat Ref</th><th>Type</th><th title="100%=one core">CPU Peak</th><th>Metric Src</th><th>Target</th><th>Down (s)</th><th>Restarts</th><th title="Return to baseline">Recovery (s)</th><th>Result</th><th>Re-Test</th></tr></thead><tbody>{filteredChaos.map((r) => <tr key={r.experiment_id}><td>{r.experiment_id}</td><td className="code-font">#{r.threat_id}</td><td className="code-font">{`${r.experiment_type}${r.experiment_type === 'cpu_stress' && r.cpu_variant ? `:${r.cpu_variant}` : ''} (Lv ${r.intensity_level})`}</td><td>{r.cpu_peak}%</td><td>{r.metric_source || ((r.notes || '').includes('MetricSource=docker') ? 'docker' : 'fallback')}</td><td>{r.experiment_type === 'process_disruption' ? (r.target_service || 'generic') : 'N/A'}</td><td>{r.experiment_type === 'process_disruption' ? (r.service_down_time != null ? (r.service_down_time + 's') : '0s') : 'N/A'}</td><td>{r.experiment_type === 'process_disruption' ? (r.restart_attempts != null ? r.restart_attempts : 0) : 'N/A'}</td><td>{r.recovery_time_secs}s</td><td><span className={`badge ${r.result === 'Resilient' ? 'low' : 'high'}`}>{r.result}</span></td><td>{r.is_retest ? 'Yes' : 'No'}</td></tr>)}{filteredChaos.length === 0 && <tr><td colSpan="11" style={{ textAlign: 'center' }}>No adaptive runs recorded yet.</td></tr>}</tbody></table></div>
+          <div className="panel"><table><thead><tr><th>Experiment ID</th><th>Threat Ref</th><th>Type</th><th title="100%=one core">CPU Peak</th><th>Metric Src</th><th>Target</th><th>Down (s)</th><th>Restarts</th><th title="Return to baseline">Recovery (s)</th><th>Outcome</th><th>Defense Applied</th><th>Before/After</th><th>Re-Test</th></tr></thead><tbody>{filteredChaos.map((r) => <tr key={r.experiment_id} style={{ cursor: 'pointer', background: openExperimentId === r.experiment_id ? 'rgba(50,120,240,0.08)' : 'transparent' }} onClick={() => handleExperimentClick(r)}><td>{r.experiment_id}</td><td className="code-font">#{r.threat_id}</td><td className="code-font">{`${r.experiment_type}${r.experiment_type === 'cpu_stress' && r.cpu_variant ? `:${r.cpu_variant}` : ''} (Lv ${r.intensity_level})`}</td><td>{r.cpu_peak}%</td><td>{r.metric_source || ((r.notes || '').includes('MetricSource=docker') ? 'docker' : 'fallback')}</td><td>{r.experiment_type === 'process_disruption' ? (r.target_service || 'generic') : 'N/A'}</td><td>{r.experiment_type === 'process_disruption' ? (r.service_down_time != null ? (r.service_down_time + 's') : '0s') : 'N/A'}</td><td>{r.experiment_type === 'process_disruption' ? (r.restart_attempts != null ? r.restart_attempts : 0) : 'N/A'}</td><td>{r.recovery_time_secs}s</td><td><span className={`badge ${r.outcome_state === 'Resilient' ? 'low' : r.outcome_state === 'Degraded' ? 'medium' : 'high'}`}>{r.outcome_state || r.result}</span></td><td className="code-font">{r.defense_action || 'no_action'}</td><td style={{ color: 'var(--text-secondary)' }}>{beforeAfterText(r)}</td><td>{r.is_retest ? 'Yes' : 'No'}</td></tr>)}{filteredChaos.length === 0 && <tr><td colSpan="13" style={{ textAlign: 'center' }}>No adaptive runs recorded yet.</td></tr>}</tbody></table></div>
           <div className="panel" style={{ marginTop: 20 }}><h3 style={{ marginBottom: 12, color: 'var(--text-secondary)' }}>Critical Threat Section</h3><table><thead><tr><th>Threat</th><th>Experiment</th><th>Intensity</th><th>Recovery</th><th>Command</th></tr></thead><tbody>{criticalThreats.map((c) => <tr key={c.experiment_id}><td>{c.threat_type.replaceAll('_', ' ')}</td><td className="code-font">{c.experiment_type}</td><td>Lv {c.intensity_level}</td><td>{c.recovery_time_secs}s</td><td className="code-font">{`> ${c.raw_input}`}</td></tr>)}{criticalThreats.length === 0 && <tr><td colSpan="5" style={{ textAlign: 'center' }}>No critical threats detected at max intensity yet.</td></tr>}</tbody></table></div>
         </div>}
+      {openExperiment && (
+        <>
+          <div onClick={() => { setOpenExperimentId(null); setOpenExperiment(null); }} style={{ position: 'fixed', top: 0, left: 0, width: '100vw', height: '100vh', background: 'rgba(0,0,0,0.35)', zIndex: 40 }} />
+          <div style={{ position: 'fixed', top: 0, right: 0, width: 440, height: '100vh', background: 'rgba(8,10,20,0.97)', borderLeft: '1px solid var(--border-glass)', padding: 16, overflowY: 'auto', zIndex: 50 }} onClick={(e) => e.stopPropagation()}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+              <h3>Experiment Details</h3>
+              <button className="nav-btn" onClick={() => { setOpenExperimentId(null); setOpenExperiment(null); }}>Close</button>
+            </div>
+            <div className="panel" style={{ padding: 14 }}>
+              <p><strong>Experiment ID:</strong> {openExperiment.experiment_id}</p>
+              <p><strong>Threat Ref:</strong> <span className="code-font">#{openExperiment.threat_id}</span></p>
+              <p><strong>Type:</strong> {openExperiment.experiment_type}{openExperiment.cpu_variant ? `:${openExperiment.cpu_variant}` : ''} (Lv {openExperiment.intensity_level})</p>
+              <p><strong>Recovery Time:</strong> {openExperiment.recovery_time_secs}s</p>
+              <p><strong>Defense Applied:</strong> <span className="code-font">{openExperiment.defense_action || 'no_action'}</span></p>
+              <p><strong>Outcome:</strong> <span className={`badge ${openExperiment.outcome_state === 'Resilient' ? 'low' : openExperiment.outcome_state === 'Degraded' ? 'medium' : 'high'}`}>{openExperiment.outcome_state || openExperiment.result}</span></p>
+              <p><strong>Metric Source:</strong> {openExperiment.metric_source || ((openExperiment.notes || '').includes('MetricSource=docker') ? 'docker' : 'fallback')}</p>
+              <p><strong>After/Before:</strong> {beforeAfterText(openExperiment)}</p>
+              <p><strong>Re-Test:</strong> {openExperiment.is_retest ? 'Yes' : 'No'}</p>
+              {openExperiment.target_service && <p><strong>Target:</strong> {openExperiment.target_service}</p>}
+              {openExperiment.service_down_time != null && <p><strong>Service Down:</strong> {openExperiment.service_down_time}s</p>}
+              {openExperiment.restart_attempts != null && <p><strong>Restart Attempts:</strong> {openExperiment.restart_attempts}</p>}
+              {openExperiment.cpu_peak != null && <p><strong>CPU Peak:</strong> {openExperiment.cpu_peak}%</p>}
+              <h4 style={{ marginTop: 16, marginBottom: 8, color: 'var(--text-secondary)' }}>Best Learned Config</h4>
+              <p className="code-font">{getExperimentRecommendation(openExperiment) || 'No learned configuration available for this run.'}</p>
+            </div>
+          </div>
+        </>
+      )}
       </div>
 
       {selectedThreat && (
@@ -536,7 +920,7 @@ export default function App() {
           <div className="panel" style={{ padding: 14 }}>
             <p><strong>Command:</strong> <span className="code-font">{selectedThreat.raw_input}</span></p>
             <p><strong>Category:</strong> {selectedThreat.threat_type.replaceAll('_', ' ')}</p>
-            <p><strong>Mapped Test:</strong> <span className="code-font">{selectedThreat.mapped_experiment_type || selectedThreat.experiment_type}</span></p>
+            <p><strong>Mapped Test:</strong> <span className="code-font">{mappedTestForThreat(selectedThreat)}</span></p>
             <p><strong>Source:</strong> {selectedThreat.source === 'ai' ? 'AI Model' : 'Rule Engine'}</p>
             <p style={{ marginTop: 8 }}><strong>AI Explanation:</strong> {explain(selectedThreat.threat_type, selectedThreat.raw_input)}</p>
             <p><strong>Observed behavior:</strong> {drawerLatest ? `${drawerLatest.result} at Lv ${drawerLatest.intensity_level}` : 'No run yet'}</p>

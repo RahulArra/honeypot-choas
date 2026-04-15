@@ -121,6 +121,14 @@ def _log_event(event, **payload):
 
 def _deterministic_override(raw_input: str):
     normalized = _normalize_cache_key(raw_input)
+    if normalized in {"cat /etc/passwd", "cat /etc/shadow"}:
+        return {
+            "type": "Sensitive_Data_Access",
+            "severity": "Medium",
+            "confidence": 0.95,
+            "experiment": get_rule_based_experiment("Sensitive_Data_Access", "Medium"),
+            "source": "rule",
+        }
     # Disk-heavy operations must not be treated as CPU exhaustion.
     if normalized.startswith("dd ") and ("if=/dev/zero" in normalized or "if=/dev/urandom" in normalized) and "of=" in normalized:
         return {

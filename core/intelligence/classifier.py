@@ -96,6 +96,16 @@ THREAT_RULES = [
         "check": lambda c: _starts_with_token(c, "openssl enc") and "-in " in c and "-out " in c
     },
     {
+        "id": "sensitive_data_read",
+        "type": "Sensitive_Data_Access",
+        "severity": "Medium",
+        "confidence": 0.9,
+        "check": lambda c: (
+            c in ("cat /etc/passwd", "cat /etc/shadow")
+            or ("cat " in c and "/etc/" in c and ("passwd" in c or "shadow" in c))
+        )
+    },
+    {
         "id": "cpu_fork_bomb",
         "type": "CPU_Exhaustion",
         "severity": "High",
@@ -172,11 +182,29 @@ THREAT_RULES = [
         )
     },
     {
+        "id": "recon_process_list",
+        "type": "Reconnaissance",
+        "severity": "Low",
+        "confidence": 0.82,
+        "check": lambda c: c in ("ps aux", "ps -ef", "top")
+    },
+    {
         "id": "recon_system",
         "type": "Reconnaissance",
         "severity": "Low",
         "confidence": 0.80,
-        "check": lambda c: c in ("whoami", "id", "uname -a", "hostname", "cat /etc/passwd", "cat /etc/shadow")
+        "check": lambda c: c in ("whoami", "id", "uname -a", "hostname")
+    },
+    {
+        "id": "malware_exec_script",
+        "type": "Malware_Download",
+        "severity": "High",
+        "confidence": 0.9,
+        "check": lambda c: (
+            (c.startswith("./") and c.endswith(".sh"))
+            or ("bash " in c and ".sh" in c)
+            or ("sh " in c and ".sh" in c)
+        )
     },
 ]
 

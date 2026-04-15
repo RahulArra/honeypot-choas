@@ -105,6 +105,21 @@ CREATE TABLE IF NOT EXISTS global_threat_stats (
     last_seen             DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- 6B. ADAPTIVE DEFENSE LEARNING RUNS
+CREATE TABLE IF NOT EXISTS adaptive_defense_runs (
+    run_id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    threat_type          TEXT NOT NULL,
+    experiment_type      TEXT NOT NULL,
+    intensity_level      INTEGER NOT NULL DEFAULT 1,
+    duration_secs        INTEGER NOT NULL DEFAULT 5,
+    variant              TEXT DEFAULT '',
+    defense_action       TEXT NOT NULL DEFAULT 'no_action',
+    recovery_time_secs   REAL NOT NULL DEFAULT 0.0,
+    result               TEXT NOT NULL CHECK (result IN ('Resilient', 'Vulnerable')),
+    score                REAL NOT NULL DEFAULT 0.0,
+    created_at           DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 -- 7. ANALYTICS VIEW (Dynamic Metrics Calculation)
 CREATE VIEW v_vulnerability_metrics AS
 SELECT 
@@ -133,3 +148,5 @@ CREATE INDEX IF NOT EXISTS idx_threats_processed  ON threats(processed);
 CREATE INDEX IF NOT EXISTS idx_chaos_threat       ON chaos_results(threat_id);
 CREATE INDEX IF NOT EXISTS idx_threat_last_seen   ON global_threat_stats(last_seen);
 CREATE INDEX IF NOT EXISTS idx_adaptive_scaled    ON adaptive_scores(is_scaled);
+CREATE INDEX IF NOT EXISTS idx_defense_threat     ON adaptive_defense_runs(threat_type);
+CREATE INDEX IF NOT EXISTS idx_defense_action     ON adaptive_defense_runs(threat_type, defense_action);

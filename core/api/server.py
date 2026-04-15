@@ -2,6 +2,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from core.database.db_client import safe_execute
 from core.chaos.threat_map import get_experiment_type
+import os
+import json
+
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
 
 app = FastAPI(title="Honeypot Chaos API")
 
@@ -43,6 +50,8 @@ def _parse_notes(notes):
         "memory_mb": None,
         "disk_intensity": None,
         "forks": None,
+        "defense_action": "",
+        "outcome_state": "",
     }
     text = notes or ""
     for part in text.split(","):
@@ -92,7 +101,20 @@ def _parse_notes(notes):
             parsed["disk_intensity"] = int(_to_float(value, 0))
         elif key == "Forks":
             parsed["forks"] = int(_to_float(value, 0))
+        elif key == "DefenseAction":
+            parsed["defense_action"] = value
+        elif key == "OutcomeState":
+            parsed["outcome_state"] = value
     return parsed
+
+
+def _pick_defense_action_from_timeline_row(row) -> str:
+    # row shape for session timeline:
+    # (..., notes, fallback_defense_action)
+    parsed = _parse_notes(row[11] or "")
+    if parsed.get("defense_action"):
+        return parsed["defense_action"]
+    return row[12] or "no_action"
 
 @app.get("/api/overview")
 def get_overview():
@@ -107,8 +129,107 @@ def get_overview():
 
 @app.get("/api/sessions")
 def get_sessions():
-    rows = safe_execute("SELECT session_id, source_ip, start_time, duration_secs, total_commands, status FROM sessions ORDER BY start_time DESC LIMIT 50", fetch=True)
-    return [{"session_id": r[0], "source_ip": r[1], "start_time": r[2], "duration_secs": r[3], "total_commands": r[4], "status": r[5]} for r in rows] if rows else []
+    rows = safe_execute(
+        """
+        SELECT
+            s.session_id,
+            s.source_ip,
+            s.start_time,
+            s.duration_secs,
+            s.total_commands,
+            s.status,
+            COALESCE((
+                SELECT t2.threat_type
+                FROM threats t2
+                WHERE t2.session_id = s.session_id
+                GROUP BY t2.threat_type
+                ORDER BY COUNT(*) DESC, t2.threat_type
+                LIMIT 1
+            ), 'None') AS top_threat,
+            COALESCE((
+                SELECT ROUND(AVG(CASE WHEN cr.result = 'Vulnerable' THEN 1.0 ELSE 0.0 END), 3)
+                FROM threats t3
+                JOIN chaos_results cr ON cr.threat_id = t3.threat_id
+                WHERE t3.session_id = s.session_id
+            ), 0.0) AS failure_rate
+        FROM sessions s
+        ORDER BY s.start_time DESC
+        LIMIT 100
+        """,
+        fetch=True,
+    )
+    return [
+        {
+            "session_id": r[0],
+            "source_ip": r[1],
+            "start_time": r[2],
+            "duration_secs": r[3],
+            "total_commands": r[4],
+            "status": r[5],
+            "top_threat": r[6] or "None",
+            "failure_rate": float(r[7] or 0.0),
+        }
+        for r in (rows or [])
+    ]
+
+
+@app.get("/api/session/{session_id}")
+def get_session_timeline(session_id: str):
+    rows = safe_execute(
+        """
+        SELECT
+            c.command_id,
+            c.raw_input,
+            c.timestamp,
+            t.threat_id,
+            t.threat_type,
+            t.severity,
+            cr.experiment_type,
+            cr.intensity_level,
+            cr.duration_secs,
+            cr.recovery_time_secs,
+            cr.result,
+            cr.notes,
+            COALESCE((
+                SELECT adr.defense_action
+                FROM adaptive_defense_runs adr
+                WHERE adr.threat_type = t.threat_type
+                  AND adr.experiment_type = cr.experiment_type
+                  AND adr.intensity_level = cr.intensity_level
+                  AND adr.duration_secs = cr.duration_secs
+                ORDER BY adr.run_id DESC
+                LIMIT 1
+            ), 'no_action') AS fallback_defense_action
+        FROM commands c
+        LEFT JOIN threats t ON t.command_id = c.command_id
+        LEFT JOIN chaos_results cr ON cr.threat_id = t.threat_id
+        WHERE c.session_id = ?
+        ORDER BY c.timestamp ASC, cr.experiment_id ASC
+        """,
+        (session_id,),
+        fetch=True,
+    ) or []
+
+    timeline = []
+    for r in rows:
+        timeline.append(
+            {
+                "command_id": r[0],
+                "command": r[1] or "",
+                "timestamp": r[2],
+                "threat_id": r[3],
+                "threat_type": r[4] or "Unknown",
+                "severity": r[5] or "Low",
+                "experiment_type": r[6] or "",
+                "intensity": int(r[7] or 0),
+                "duration_secs": int(r[8] or 0),
+                "recovery_time_secs": _to_float(r[9], 0.0),
+                "result": r[10] or "",
+                "defense_action": _pick_defense_action_from_timeline_row(r),
+                "outcome_state": (_parse_notes(r[11] or "").get("outcome_state") or r[10] or "Resilient"),
+            }
+        )
+    return timeline
 
 
 @app.get("/api/session_activity")
@@ -232,8 +353,204 @@ def get_chaos():
             "mem_stabilized_secs": parsed["mem_stabilized_secs"],
             "cpu_limit": parsed["cpu_limit"],
             "mem_limit": parsed["mem_limit"],
+            "defense_action": parsed["defense_action"] or "no_action",
+            "outcome_state": parsed["outcome_state"] or r[4] or "Resilient",
         })
     return data
+
+
+@app.get("/api/attack_behavior_insights")
+def get_attack_behavior_insights():
+    top_commands_rows = safe_execute(
+        """
+        SELECT raw_input, COUNT(*) AS cnt
+        FROM commands
+        WHERE TRIM(raw_input) <> ''
+        GROUP BY raw_input
+        ORDER BY cnt DESC, raw_input
+        LIMIT 15
+        """,
+        fetch=True,
+    ) or []
+
+    top_threat_rows = safe_execute(
+        """
+        SELECT threat_type, COUNT(*) AS cnt
+        FROM threats
+        GROUP BY threat_type
+        ORDER BY cnt DESC, threat_type
+        LIMIT 15
+        """,
+        fetch=True,
+    ) or []
+
+    experiment_rows = safe_execute(
+        """
+        SELECT experiment_type, COUNT(*) AS cnt
+        FROM chaos_results
+        GROUP BY experiment_type
+        ORDER BY cnt DESC, experiment_type
+        LIMIT 15
+        """,
+        fetch=True,
+    ) or []
+
+    return {
+        "top_commands": [{"command": r[0] or "", "count": int(r[1] or 0)} for r in top_commands_rows],
+        "top_threat_types": [{"threat_type": r[0] or "Unknown", "count": int(r[1] or 0)} for r in top_threat_rows],
+        "top_experiment_types": [{"experiment_type": r[0] or "unknown", "count": int(r[1] or 0)} for r in experiment_rows],
+    }
+
+
+@app.get("/api/malicious_activity")
+def get_malicious_activity():
+    rows = safe_execute(
+        """
+        SELECT category, command, COUNT(*) AS cnt
+        FROM (
+            SELECT 'Sensitive Access' AS category, raw_input AS command
+            FROM commands
+            WHERE lower(raw_input) LIKE '%cat %'
+               OR lower(raw_input) LIKE '%/etc%'
+               OR lower(raw_input) LIKE '%password%'
+            UNION ALL
+            SELECT 'Downloads' AS category, raw_input AS command
+            FROM commands
+            WHERE lower(raw_input) LIKE '%wget%'
+               OR lower(raw_input) LIKE '%curl%'
+            UNION ALL
+            SELECT 'Execution' AS category, raw_input AS command
+            FROM commands
+            WHERE lower(raw_input) LIKE '%chmod%'
+               OR lower(raw_input) LIKE '%.sh%'
+               OR lower(raw_input) LIKE './%'
+               OR lower(raw_input) LIKE 'bash %'
+               OR lower(raw_input) LIKE 'sh %'
+        ) x
+        GROUP BY category, command
+        ORDER BY cnt DESC, command
+        LIMIT 40
+        """,
+        fetch=True,
+    ) or []
+    return [{"category": r[0], "command": r[1], "count": int(r[2] or 0)} for r in rows]
+
+
+@app.get("/api/learning_transparency")
+def get_learning_transparency():
+    rows = safe_execute(
+        """
+        SELECT defense_action, ROUND(AVG(score), 3) AS avg_score, COUNT(*) AS runs
+        FROM adaptive_defense_runs
+        GROUP BY defense_action
+        ORDER BY avg_score ASC, runs DESC
+        """,
+        fetch=True,
+    ) or []
+    return [{"defense_action": r[0] or "no_action", "avg_score": float(r[1] or 0.0), "runs": int(r[2] or 0)} for r in rows]
+
+
+def _heuristic_session_analysis(commands, threats, chaos_rows):
+    top_threat = "Unknown"
+    if threats:
+        counts = {}
+        for t in threats:
+            tt = t.get("threat_type", "Unknown")
+            counts[tt] = counts.get(tt, 0) + 1
+        top_threat = sorted(counts.items(), key=lambda x: x[1], reverse=True)[0][0]
+    vuln = sum(1 for x in chaos_rows if (x.get("result") or "") == "Vulnerable")
+    total = max(1, len(chaos_rows))
+    fail_pct = round((vuln / total) * 100, 1)
+    pattern = f"Session shows repeated {top_threat.replace('_', ' ')} activity with {fail_pct}% vulnerable outcomes."
+    intent = "Likely resource exhaustion / service disruption probing." if "Exhaustion" in top_threat or "Privilege" in top_threat else "Likely reconnaissance or capability testing."
+    weakness = "Adaptive defenses are still not reducing failure rate consistently."
+    recommendation = "Prioritize actions with lower defense score, increase pre-emptive limits, and isolate high-risk command patterns."
+    return {
+        "attack_pattern": pattern,
+        "attacker_intent": intent,
+        "system_weakness": weakness,
+        "recommendation": recommendation,
+    }
+
+
+@app.post("/api/session_analysis/{session_id}")
+def post_session_analysis(session_id: str):
+    command_rows = safe_execute(
+        """
+        SELECT command_id, raw_input, timestamp
+        FROM commands
+        WHERE session_id = ?
+        ORDER BY timestamp ASC
+        LIMIT 200
+        """,
+        (session_id,),
+        fetch=True,
+    ) or []
+    threat_rows = safe_execute(
+        """
+        SELECT t.threat_id, t.threat_type, t.severity, t.confidence, t.source
+        FROM threats t
+        WHERE t.session_id = ?
+        ORDER BY t.timestamp ASC
+        LIMIT 200
+        """,
+        (session_id,),
+        fetch=True,
+    ) or []
+    chaos_rows = safe_execute(
+        """
+        SELECT cr.experiment_type, cr.intensity_level, cr.recovery_time_secs, cr.result
+        FROM chaos_results cr
+        JOIN threats t ON t.threat_id = cr.threat_id
+        WHERE t.session_id = ?
+        ORDER BY cr.started_at ASC
+        LIMIT 300
+        """,
+        (session_id,),
+        fetch=True,
+    ) or []
+
+    commands = [{"command_id": r[0], "raw_input": r[1] or "", "timestamp": r[2]} for r in command_rows]
+    threats = [{"threat_id": r[0], "threat_type": r[1] or "Unknown", "severity": r[2] or "Low", "confidence": float(r[3] or 0.0), "source": r[4] or "rule"} for r in threat_rows]
+    chaos = [{"experiment_type": r[0] or "", "intensity_level": int(r[1] or 0), "recovery_time_secs": _to_float(r[2], 0.0), "result": r[3] or ""} for r in chaos_rows]
+
+    # AI optional: use Groq OpenAI-compatible endpoint if key exists.
+    api_key = os.environ.get("GROK_API_KEY", "")
+    if not api_key or OpenAI is None:
+        return _heuristic_session_analysis(commands, threats, chaos)
+
+    summary_payload = {
+        "commands": [c["raw_input"] for c in commands[:40]],
+        "threats": threats[:40],
+        "chaos": chaos[:60],
+    }
+    prompt = (
+        "Analyze this honeypot session and return JSON with keys: "
+        "attack_pattern, attacker_intent, system_weakness, recommendation.\n"
+        f"Session data:\n{json.dumps(summary_payload)}"
+    )
+    try:
+        client = OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1", timeout=8)
+        resp = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": "You are a SOC analyst. Return compact JSON only."},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=260,
+            temperature=0.2,
+            response_format={"type": "json_object"},
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        parsed = json.loads(text)
+        return {
+            "attack_pattern": str(parsed.get("attack_pattern", "")),
+            "attacker_intent": str(parsed.get("attacker_intent", "")),
+            "system_weakness": str(parsed.get("system_weakness", "")),
+            "recommendation": str(parsed.get("recommendation", "")),
+        }
+    except Exception:
+        return _heuristic_session_analysis(commands, threats, chaos)
 
 
 @app.get("/api/vulnerability_metrics")
@@ -405,6 +722,87 @@ def get_learning_insights():
     report.sort(key=lambda x: (-x["max_instability"], -x["degrading_runs"], x["threat_type"]))
     config_memory.sort(key=lambda x: (x["avg_score"], -x["runs"]))
     return {"report": report, "config_memory": config_memory[:20]}
+
+
+@app.get("/api/defense_learning")
+def get_defense_learning():
+    action_rows = safe_execute(
+        """
+        SELECT
+            threat_type,
+            defense_action,
+            COUNT(*) as runs,
+            ROUND(AVG(score), 3) as avg_score,
+            ROUND(AVG(recovery_time_secs), 3) as avg_recovery,
+            ROUND(AVG(CASE WHEN result='Vulnerable' THEN 1.0 ELSE 0.0 END), 3) as fail_rate
+        FROM adaptive_defense_runs
+        GROUP BY threat_type, defense_action
+        ORDER BY threat_type ASC, avg_score ASC
+        """,
+        fetch=True,
+    ) or []
+
+    by_threat = {}
+    for r in action_rows:
+        threat = r[0] or "Unknown"
+        by_threat.setdefault(threat, []).append(
+            {
+                "action": r[1] or "no_action",
+                "runs": int(r[2] or 0),
+                "avg_score": float(r[3] or 0.0),
+                "avg_recovery": float(r[4] or 0.0),
+                "fail_rate": float(r[5] or 0.0),
+            }
+        )
+
+    summary = []
+    for threat, actions in by_threat.items():
+        ranked = sorted(actions, key=lambda x: x["avg_score"])
+        decision_reason = "No action history yet."
+        if ranked:
+            best = ranked[0]
+            decision_reason = (
+                f"Selected {best['action']} because it has the lowest avg score "
+                f"({round(float(best['avg_score']), 2)}) over {int(best['runs'])} run(s)."
+            )
+        summary.append(
+            {
+                "threat_type": threat,
+                "best_action": ranked[0] if ranked else None,
+                "actions": ranked,
+                "decision_reason": decision_reason,
+            }
+        )
+
+    recent_rows = safe_execute(
+        """
+        SELECT
+            run_id, threat_type, experiment_type, intensity_level, duration_secs, variant,
+            defense_action, recovery_time_secs, result, score, created_at
+        FROM adaptive_defense_runs
+        ORDER BY run_id DESC
+        LIMIT 40
+        """,
+        fetch=True,
+    ) or []
+
+    recent = [
+        {
+            "run_id": r[0],
+            "threat_type": r[1] or "Unknown",
+            "experiment_type": r[2] or "cpu_stress",
+            "intensity_level": int(r[3] or 1),
+            "duration_secs": int(r[4] or 0),
+            "variant": r[5] or "",
+            "defense_action": r[6] or "no_action",
+            "recovery_time_secs": float(r[7] or 0.0),
+            "result": r[8] or "Resilient",
+            "score": float(r[9] or 0.0),
+            "created_at": r[10],
+        }
+        for r in recent_rows
+    ]
+    return {"summary": summary, "recent": recent}
 
 
 @app.get("/api/critical_threats")

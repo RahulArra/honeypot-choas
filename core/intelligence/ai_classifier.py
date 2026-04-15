@@ -40,6 +40,7 @@ VALID_THREAT_TYPES = {
     "Integrity_Risk",
     "CPU_Exhaustion",
     "Reconnaissance",
+    "Sensitive_Data_Access",
     "Data_Exfiltration",
     "Persistence_Attempt",
     "Lateral_Movement",
@@ -82,7 +83,7 @@ RESPONSE FORMAT (strict JSON, nothing else):
   }
 }
 
-threat_type must be one of: Malware_Download, Privilege_Escalation, Integrity_Risk, CPU_Exhaustion, Reconnaissance, Data_Exfiltration, Persistence_Attempt, Lateral_Movement, Unknown, Benign
+threat_type must be one of: Malware_Download, Privilege_Escalation, Integrity_Risk, CPU_Exhaustion, Reconnaissance, Sensitive_Data_Access, Data_Exfiltration, Persistence_Attempt, Lateral_Movement, Unknown, Benign
 severity must be one of: Low, Medium, High
 confidence must be a float between 0.0 and 1.0
 experiment.type must be one of: cpu_stress, memory_stress, disk_io, process_disruption
@@ -204,7 +205,7 @@ def _parse_ai_json_payload(raw_text: str) -> dict:
 
     # Final fallback: salvage key fields even when shell_response JSON is broken.
     threat_match = re.search(
-        r'"threat_type"\s*:\s*"(?P<threat>Malware_Download|Privilege_Escalation|Integrity_Risk|CPU_Exhaustion|Reconnaissance|Data_Exfiltration|Persistence_Attempt|Lateral_Movement|Unknown|Benign)"',
+        r'"threat_type"\s*:\s*"(?P<threat>Malware_Download|Privilege_Escalation|Integrity_Risk|CPU_Exhaustion|Reconnaissance|Sensitive_Data_Access|Data_Exfiltration|Persistence_Attempt|Lateral_Movement|Unknown|Benign)"',
         text,
     )
     severity_match = re.search(r'"severity"\s*:\s*"(?P<severity>Low|Medium|High)"', text)

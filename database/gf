@@ -1,0 +1,1 @@
+3 input, 1 input min weight of an appple, 2 input maximum weight of an applle , 3 rd input customer nned in kg , 1 and 2 in grams, return the apples required if min weight is selected and max weight is selected if not return -1

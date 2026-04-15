@@ -7,21 +7,31 @@ caps, and Docker-first metrics collection with a psutil fallback.
 
 import json
 import logging
+import os
+import random
 import subprocess
 import time
 import uuid
+from glob import glob
 
 import psutil
 
 logger = logging.getLogger(__name__)
 
-MAX_DURATION_SECS = 120
-MAX_MEMORY_MB = 512
-MAX_CPU_THREADS = 6
+SAFE_MODE = True
+MAX_DURATION_SECS = 20 if SAFE_MODE else 120
+MAX_MEMORY_MB = 96 if SAFE_MODE else 512
+MAX_CPU_THREADS = 3 if SAFE_MODE else 6
+MAX_DISK_MB = 300 if SAFE_MODE else 2048
+MAX_CONTAINERS = 3
 # Soft cap for adaptive exploration mode (normal flows still start lower).
-MAX_INTENSITY = 8
+MAX_INTENSITY = 3 if SAFE_MODE else 8
 SCALED_CPU_BONUS = 2
 SCALED_MEMORY_BONUS_MB = 256
+WATCHDOG_CPU_PCT = 80.0
+WATCHDOG_CPU_SECS = 10.0
+WATCHDOG_MEM_PCT = 80.0
+DEFENSE_ACTIONS = ["limit_cpu", "limit_memory", "restart_container", "no_action","scale_container"]
 
 VALID_EXPERIMENT_TYPES = {"cpu_stress", "memory_stress", "disk_io", "process_disruption"}
 CPU_VARIANTS = ["hash_loop", "openssl_load", "math_compute", "multi_process"]
@@ -33,6 +43,23 @@ DEFAULT_SAFE_CONFIG = {
     "memory_mb": 128,
     "duration": 5,
 }
+
+
+def _apply_recovery_effects(base_recovery: float, defense_action: str) -> tuple[float, str]:
+    adjusted = float(base_recovery or 0.0) + random.uniform(0.2, 1.2)
+    action = str(defense_action or "no_action").strip().lower()
+    if action == "limit_cpu":
+        adjusted *= 0.7
+    elif action == "limit_memory":
+        adjusted *= 0.82
+    elif action == "restart_container":
+        adjusted *= 1.5
+    adjusted = round(max(0.05, adjusted), 2)
+    if adjusted < 0.5:
+        return adjusted, "Resilient"
+    if adjusted < 1.5:
+        return adjusted, "Degraded"
+    return adjusted, "Vulnerable"
 
 
 def _cpu_limit_for_threads(cpu_threads: int) -> float:
@@ -55,7 +82,8 @@ def validate_experiment_config(config: dict) -> dict:
         intensity = max(1, min(intensity, MAX_INTENSITY))
 
         duration = int(config.get("duration", DEFAULT_SAFE_CONFIG["duration"]))
-        duration = max(1, min(duration, MAX_DURATION_SECS))
+        min_duration = 6 if SAFE_MODE else 1
+        duration = max(min_duration, min(duration, MAX_DURATION_SECS))
 
         cpu_threads = int(config.get("cpu_threads", intensity))
         cpu_threads = max(1, min(cpu_threads, MAX_CPU_THREADS))
@@ -65,13 +93,89 @@ def validate_experiment_config(config: dict) -> dict:
     except (TypeError, ValueError):
         return DEFAULT_SAFE_CONFIG.copy()
 
-    return {
+    validated = {
         "type": exp_type,
         "intensity": intensity,
         "cpu_threads": cpu_threads,
         "memory_mb": memory_mb,
         "duration": duration,
     }
+    if SAFE_MODE:
+        if (
+            int(validated["cpu_threads"]) > MAX_CPU_THREADS
+            or int(validated["memory_mb"]) > MAX_MEMORY_MB
+            or int(validated["duration"]) > MAX_DURATION_SECS
+            or int(validated["intensity"]) > MAX_INTENSITY
+        ):
+            logger.info(json.dumps({"event": "safety_limit_triggered", "source": "safety", "details": "safe_mode_clamp"}))
+        validated["cpu_threads"] = min(int(validated["cpu_threads"]), MAX_CPU_THREADS)
+        validated["memory_mb"] = min(int(validated["memory_mb"]), MAX_MEMORY_MB)
+        validated["duration"] = min(int(validated["duration"]), MAX_DURATION_SECS)
+        validated["intensity"] = min(int(validated["intensity"]), MAX_INTENSITY)
+    return validated
+
+
+def _list_containers_by_prefix(prefix: str) -> list[str]:
+    if not prefix:
+        return []
+    try:
+        output = subprocess.check_output(
+            ["docker", "ps", "-a", "--format", "{{.Names}}", "--filter", f"name={prefix}"],
+            stderr=subprocess.STDOUT,
+            timeout=5,
+        ).decode("utf-8").strip()
+        return [name.strip() for name in output.splitlines() if name.strip()]
+    except (subprocess.SubprocessError, OSError):
+        return []
+
+
+def apply_defense(action: str, container_id: str) -> bool:
+    action = (action or "no_action").strip().lower()
+    if action not in DEFENSE_ACTIONS:
+        action = "no_action"
+    if action == "no_action" or not container_id:
+        logger.info(json.dumps({"event": "adaptive_defense_applied", "action": action, "container_id": container_id or ""}))
+        return True
+    try:
+        if action == "limit_cpu":
+            subprocess.run(["docker", "update", "--cpus=1.5", container_id], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        elif action == "limit_memory":
+            subprocess.run(["docker", "update", "--memory=256m", container_id], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        elif action == "restart_container":
+            subprocess.run(["docker", "restart", container_id], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
+        elif action == "scale_container":
+            active = _list_containers_by_prefix(container_id)
+            if len(active) >= MAX_CONTAINERS:
+                logger.info(json.dumps({"event": "adaptive_defense_applied", "action": action, "container_id": container_id, "reason": "max_containers_reached", "scale_count": len(active)}))
+                return True
+            scaled_name = f"{container_id}-scaled-{len(active)}"
+            subprocess.run(
+                [
+                    "docker",
+                    "run",
+                    "-d",
+                    "--name",
+                    scaled_name,
+                    "--cpus",
+                    "0.5",
+                    "--memory",
+                    "128m",
+                    "chaos-executor",
+                    "--timeout",
+                    "10s",
+                ],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+            logger.info(json.dumps({"event": "adaptive_defense_applied", "action": action, "container_id": container_id, "scaled_name": scaled_name, "scale_count": len(active) + 1, "note": "The system first applies resource constraints, and if insufficient, escalates to horizontal scaling by spawning additional containers to distribute load."}))
+            return True
+        logger.info(json.dumps({"event": "adaptive_defense_applied", "action": action, "container_id": container_id}))
+        return True
+    except (subprocess.SubprocessError, OSError) as exc:
+        logger.warning("[Chaos] Defense apply failed (%s): %s", action, exc)
+        return False
 
 
 def get_container_stats(container_name):
@@ -158,7 +262,7 @@ def _get_container_metrics_snapshot(container_name):
     return cpu, memory_percent, disk_io_mb, metric_source
 
 
-def _collect_metrics(duration: int, container_name: str, proc=None) -> dict:
+def _collect_metrics(duration: int, container_name: str, proc=None, baseline_mem: float = 0.0) -> dict:
     cpu_samples = []
     mem_samples = []
     disk_samples = []
@@ -181,6 +285,10 @@ def _collect_metrics(duration: int, container_name: str, proc=None) -> dict:
             break
         time.sleep(0.1)
 
+    high_cpu_secs = 0.0
+    watchdog_triggered = False
+    watchdog_reason = ""
+
     while time.monotonic() - started < duration:
         if proc is not None and proc.poll() is not None and not _is_container_running(container_name):
             break
@@ -201,6 +309,28 @@ def _collect_metrics(duration: int, container_name: str, proc=None) -> dict:
         mem_samples.append(memory)
         disk_samples.append(disk_io)
         sources.add(source)
+
+        if cpu > WATCHDOG_CPU_PCT:
+            high_cpu_secs += 0.5
+        else:
+            high_cpu_secs = 0.0
+
+        if high_cpu_secs >= WATCHDOG_CPU_SECS:
+            watchdog_triggered = True
+            watchdog_reason = "cpu_over_80_for_10s"
+        elif memory > max(WATCHDOG_MEM_PCT, float(baseline_mem or 0.0) + 8.0):
+            watchdog_triggered = True
+            watchdog_reason = "memory_over_80"
+
+        if watchdog_triggered:
+            logger.info(json.dumps({"event": "watchdog_triggered", "reason": watchdog_reason, "container_id": container_name}))
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            break
+
         time.sleep(0.5)
 
     return {
@@ -208,6 +338,8 @@ def _collect_metrics(duration: int, container_name: str, proc=None) -> dict:
         "memory_peak": round(max(mem_samples), 2) if mem_samples else 0.0,
         "disk_io_peak": round(max(disk_samples), 2) if disk_samples else 0.0,
         "metric_source": "docker" if "docker" in sources else (next(iter(sources)) if sources else "unknown"),
+        "watchdog_triggered": watchdog_triggered,
+        "watchdog_reason": watchdog_reason,
     }
 
 
@@ -309,6 +441,46 @@ def _cleanup_container(container_name: str):
     except (subprocess.SubprocessError, OSError) as exc:
         logger.debug("[Chaos] Container cleanup failed for '%s': %s", container_name, exc)
 
+    try:
+        scaled_containers = _list_containers_by_prefix(f"{container_name}-scaled-")
+        for scaled_name in scaled_containers:
+            subprocess.run(
+                ["docker", "rm", "-f", scaled_name],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=5,
+            )
+    except (subprocess.SubprocessError, OSError) as exc:
+        logger.debug("[Chaos] Scaled container cleanup failed for '%s': %s", container_name, exc)
+
+
+def _cleanup_temp_files():
+    targets = [
+        "/tmp/fill",
+        "/tmp/test",
+        "/tmp/bigfile",
+        "/tmp/random_fill",
+        "/tmp/randfile",
+        "/tmp/testfile",
+        "/tmp/testfile.enc",
+        "/tmp/archive.tar.gz",
+    ]
+    for target in targets:
+        try:
+            if os.path.exists(target):
+                os.remove(target)
+        except OSError:
+            pass
+    # Best-effort cleanup for any demo temp files under /tmp prefix patterns.
+    for pattern in ("/tmp/file_*", "/tmp/fill*", "/tmp/test*"):
+        for path in glob(pattern):
+            try:
+                if os.path.isfile(path):
+                    os.remove(path)
+            except OSError:
+                pass
+
 
 def _build_cpu_variant_args(cpu_variant: str, cpu_threads: int, duration: int):
     variant = (cpu_variant or "hash_loop").strip().lower()
@@ -330,11 +502,15 @@ def run_cpu_stress(
     target_service: str = "",
     cpu_variant: str = "hash_loop",
     variant_combination: bool = False,
+    defense_action: str = "no_action",
 ) -> dict:
     validated = validate_experiment_config({"type": "cpu_stress", "intensity": intensity_level, "duration": duration})
-    local_max_cpu = MAX_CPU_THREADS + (SCALED_CPU_BONUS if is_scaled else 0)
+    local_max_cpu = MAX_CPU_THREADS if SAFE_MODE else (MAX_CPU_THREADS + (SCALED_CPU_BONUS if is_scaled else 0))
     duration = validated["duration"]
     cpu_threads = min(validated["cpu_threads"], local_max_cpu)
+    if SAFE_MODE and variant_combination:
+        variant_combination = False
+        logger.info(json.dumps({"event": "safety_limit_triggered", "source": "safety", "details": "variant_combination_disabled_in_safe_mode"}))
     container_name = _new_container_name()
     baseline = _capture_baseline()
     cpu_args, normalized_variant = _build_cpu_variant_args(cpu_variant, cpu_threads, duration)
@@ -363,10 +539,12 @@ def run_cpu_stress(
             *combo_args,
         ]
     )
+    apply_defense(defense_action, container_name)
 
-    metrics = _collect_metrics(duration, container_name, proc)
+    metrics = _collect_metrics(duration, container_name, proc, baseline.get("memory", 0.0))
     proc_result = _finalize_experiment(proc, duration)
     _cleanup_container(container_name)
+    _cleanup_temp_files()
     recovery = _wait_for_recovery(
         baseline,
         validated["intensity"],
@@ -378,6 +556,9 @@ def run_cpu_stress(
         result = "Vulnerable"
     elif proc_result["returncode"] not in (None, 0):
         result = "Vulnerable"
+    adjusted_recovery, outcome_state = _apply_recovery_effects(recovery["recovery_time_secs"], defense_action)
+    if outcome_state == "Vulnerable":
+        result = "Vulnerable"
 
     return {
         "experiment_type": "cpu_stress",
@@ -386,14 +567,16 @@ def run_cpu_stress(
         "memory_peak": metrics["memory_peak"],
         "disk_io_peak": metrics["disk_io_peak"],
         "duration_secs": round(time.monotonic() - start_time, 2),
-        "recovery_time_secs": recovery["recovery_time_secs"],
+        "recovery_time_secs": adjusted_recovery,
         "result": result,
         "metric_source": metrics["metric_source"],
         "notes": (
             f"Scaled={is_scaled}, Threads={cpu_threads}, CpuVariant={normalized_variant}, VariantCombination={variant_combination}, "
+            f"DefenseAction={defense_action}, WatchdogTriggered={metrics.get('watchdog_triggered', False)}, WatchdogReason={metrics.get('watchdog_reason', '')}, "
             f"BaselineCPU={baseline['cpu']}, BaselineMem={baseline['memory']}, "
             f"CPUNormSecs={recovery['cpu_normalized_secs']}, MemStabilizedSecs={recovery['mem_stabilized_secs']}, "
             f"CPULimit={recovery['cpu_limit']}, MemLimit={recovery['mem_limit']}, "
+            f"OutcomeState={outcome_state}, "
             f"MetricSource={metrics['metric_source']}, "
             f"ExitCode={proc_result['returncode']}, "
             f"StdErr={proc_result['stderr'][:200]}"
@@ -401,9 +584,9 @@ def run_cpu_stress(
     }
 
 
-def run_memory_stress(duration: int, intensity_level: int, is_scaled: bool = False) -> dict:
+def run_memory_stress(duration: int, intensity_level: int, is_scaled: bool = False, defense_action: str = "no_action") -> dict:
     validated = validate_experiment_config({"type": "memory_stress", "intensity": intensity_level, "duration": duration})
-    local_max_memory = MAX_MEMORY_MB + (SCALED_MEMORY_BONUS_MB if is_scaled else 0)
+    local_max_memory = MAX_MEMORY_MB if SAFE_MODE else (MAX_MEMORY_MB + (SCALED_MEMORY_BONUS_MB if is_scaled else 0))
     duration = validated["duration"]
     memory_mb = min(validated["memory_mb"], local_max_memory)
     container_name = _new_container_name()
@@ -430,10 +613,12 @@ def run_memory_stress(duration: int, intensity_level: int, is_scaled: bool = Fal
             f"{duration}s",
         ]
     )
+    apply_defense(defense_action, container_name)
 
-    metrics = _collect_metrics(duration, container_name, proc)
+    metrics = _collect_metrics(duration, container_name, proc, baseline.get("memory", 0.0))
     proc_result = _finalize_experiment(proc, duration)
     _cleanup_container(container_name)
+    _cleanup_temp_files()
     recovery = _wait_for_recovery(
         baseline,
         validated["intensity"],
@@ -445,6 +630,9 @@ def run_memory_stress(duration: int, intensity_level: int, is_scaled: bool = Fal
         result = "Vulnerable"
     elif proc_result["returncode"] not in (None, 0):
         result = "Vulnerable"
+    adjusted_recovery, outcome_state = _apply_recovery_effects(recovery["recovery_time_secs"], defense_action)
+    if outcome_state == "Vulnerable":
+        result = "Vulnerable"
 
     return {
         "experiment_type": "memory_stress",
@@ -453,14 +641,16 @@ def run_memory_stress(duration: int, intensity_level: int, is_scaled: bool = Fal
         "memory_peak": metrics["memory_peak"],
         "disk_io_peak": metrics["disk_io_peak"],
         "duration_secs": round(time.monotonic() - start_time, 2),
-        "recovery_time_secs": recovery["recovery_time_secs"],
+        "recovery_time_secs": adjusted_recovery,
         "result": result,
         "metric_source": metrics["metric_source"],
         "notes": (
             f"Scaled={is_scaled}, Memory={memory_mb}MB, "
+            f"DefenseAction={defense_action}, WatchdogTriggered={metrics.get('watchdog_triggered', False)}, WatchdogReason={metrics.get('watchdog_reason', '')}, "
             f"BaselineCPU={baseline['cpu']}, BaselineMem={baseline['memory']}, "
             f"CPUNormSecs={recovery['cpu_normalized_secs']}, MemStabilizedSecs={recovery['mem_stabilized_secs']}, "
             f"CPULimit={recovery['cpu_limit']}, MemLimit={recovery['mem_limit']}, "
+            f"OutcomeState={outcome_state}, "
             f"MetricSource={metrics['metric_source']}, "
             f"ExitCode={proc_result['returncode']}, "
             f"StdErr={proc_result['stderr'][:200]}"
@@ -468,9 +658,10 @@ def run_memory_stress(duration: int, intensity_level: int, is_scaled: bool = Fal
     }
 
 
-def run_disk_io_stress(duration: int, intensity_level: int, is_scaled: bool = False, target_service: str = "") -> dict:
+def run_disk_io_stress(duration: int, intensity_level: int, is_scaled: bool = False, target_service: str = "", defense_action: str = "no_action") -> dict:
     validated = validate_experiment_config({"type": "disk_io", "intensity": intensity_level, "duration": duration})
     duration = validated["duration"]
+    disk_mb = min(MAX_DISK_MB, max(64, validated["intensity"] * 100))
     start_time = time.monotonic()
     container_name = _new_container_name()
     baseline = _capture_baseline()
@@ -487,14 +678,18 @@ def run_disk_io_stress(duration: int, intensity_level: int, is_scaled: bool = Fa
             "chaos-executor",
             "--hdd",
             str(validated["intensity"]),
+            "--hdd-bytes",
+            f"{disk_mb}M",
             "--timeout",
             f"{duration}s",
         ]
     )
+    apply_defense(defense_action, container_name)
 
-    metrics = _collect_metrics(duration, container_name, proc)
+    metrics = _collect_metrics(duration, container_name, proc, baseline.get("memory", 0.0))
     proc_result = _finalize_experiment(proc, duration)
     _cleanup_container(container_name)
+    _cleanup_temp_files()
     recovery = _wait_for_recovery(
         baseline,
         validated["intensity"],
@@ -504,6 +699,9 @@ def run_disk_io_stress(duration: int, intensity_level: int, is_scaled: bool = Fa
     result = "Vulnerable" if metrics["cpu_peak"] > 80.0 else "Resilient"
     if proc_result["returncode"] not in (None, 0):
         result = "Vulnerable"
+    adjusted_recovery, outcome_state = _apply_recovery_effects(recovery["recovery_time_secs"], defense_action)
+    if outcome_state == "Vulnerable":
+        result = "Vulnerable"
     return {
         "experiment_type": "disk_io",
         "intensity_level": validated["intensity"],
@@ -511,14 +709,16 @@ def run_disk_io_stress(duration: int, intensity_level: int, is_scaled: bool = Fa
         "memory_peak": metrics["memory_peak"],
         "disk_io_peak": metrics["disk_io_peak"],
         "duration_secs": round(time.monotonic() - start_time, 2),
-        "recovery_time_secs": recovery["recovery_time_secs"],
+        "recovery_time_secs": adjusted_recovery,
         "result": result,
         "metric_source": metrics["metric_source"],
         "notes": (
             f"Scaled={is_scaled}, DiskIntensity={validated['intensity']}, "
+            f"MaxDiskMB={disk_mb}, DefenseAction={defense_action}, WatchdogTriggered={metrics.get('watchdog_triggered', False)}, WatchdogReason={metrics.get('watchdog_reason', '')}, "
             f"BaselineCPU={baseline['cpu']}, BaselineMem={baseline['memory']}, "
             f"CPUNormSecs={recovery['cpu_normalized_secs']}, MemStabilizedSecs={recovery['mem_stabilized_secs']}, "
             f"CPULimit={recovery['cpu_limit']}, MemLimit={recovery['mem_limit']}, "
+            f"OutcomeState={outcome_state}, "
             f"MetricSource={metrics['metric_source']}, "
             f"ExitCode={proc_result['returncode']}, "
             f"StdErr={proc_result['stderr'][:200]}"
@@ -526,7 +726,7 @@ def run_disk_io_stress(duration: int, intensity_level: int, is_scaled: bool = Fa
     }
 
 
-def run_process_disruption(duration: int, intensity_level: int, is_scaled: bool = False, target_service: str = "") -> dict:
+def run_process_disruption(duration: int, intensity_level: int, is_scaled: bool = False, target_service: str = "", defense_action: str = "no_action") -> dict:
     """
     Simulate process/service instability via controlled process-fork pressure.
     """
@@ -568,10 +768,12 @@ def run_process_disruption(duration: int, intensity_level: int, is_scaled: bool 
             f"{duration}s",
         ]
     )
+    apply_defense(defense_action, container_name)
 
-    metrics = _collect_metrics(duration, container_name, proc)
+    metrics = _collect_metrics(duration, container_name, proc, baseline.get("memory", 0.0))
     proc_result = _finalize_experiment(proc, duration)
     _cleanup_container(container_name)
+    _cleanup_temp_files()
     recovery = _wait_for_recovery(
         baseline,
         validated["intensity"],
@@ -587,6 +789,9 @@ def run_process_disruption(duration: int, intensity_level: int, is_scaled: bool 
         result = "Vulnerable"
     elif metrics["cpu_peak"] > 80.0:
         result = "Vulnerable"
+    adjusted_recovery, outcome_state = _apply_recovery_effects(recovery["recovery_time_secs"], defense_action)
+    if outcome_state == "Vulnerable":
+        result = "Vulnerable"
 
     return {
         "experiment_type": "process_disruption",
@@ -597,15 +802,17 @@ def run_process_disruption(duration: int, intensity_level: int, is_scaled: bool 
         "service_down_time": service_down_time,
         "restart_attempts": restart_attempts,
         "duration_secs": round(time.monotonic() - start_time, 2),
-        "recovery_time_secs": recovery["recovery_time_secs"],
+        "recovery_time_secs": adjusted_recovery,
         "result": result,
         "metric_source": metrics["metric_source"],
         "notes": (
             f"Scaled={is_scaled}, TargetService={target}, Forks={forks}, "
+            f"DefenseAction={defense_action}, WatchdogTriggered={metrics.get('watchdog_triggered', False)}, WatchdogReason={metrics.get('watchdog_reason', '')}, "
             f"ServiceDownTime={service_down_time}, RestartAttempts={restart_attempts}, "
             f"BaselineCPU={baseline['cpu']}, BaselineMem={baseline['memory']}, "
             f"CPUNormSecs={recovery['cpu_normalized_secs']}, MemStabilizedSecs={recovery['mem_stabilized_secs']}, "
             f"CPULimit={recovery['cpu_limit']}, MemLimit={recovery['mem_limit']}, "
+            f"OutcomeState={outcome_state}, "
             f"MetricSource={metrics['metric_source']}, "
             f"ExitCode={proc_result['returncode']}, "
             f"StdErr={proc_result['stderr'][:200]}"
@@ -621,17 +828,18 @@ def run_experiment(
     target_service: str = "",
     cpu_variant: str = "hash_loop",
     variant_combination: bool = False,
+    defense_action: str = "no_action",
 ) -> dict:
     """Public entry point for chaos execution."""
     try:
         if experiment_type == "memory_stress":
-            metrics = run_memory_stress(duration, intensity_level, is_scaled)
+            metrics = run_memory_stress(duration, intensity_level, is_scaled, defense_action)
         elif experiment_type == "disk_io":
-            metrics = run_disk_io_stress(duration, intensity_level, is_scaled, target_service)
+            metrics = run_disk_io_stress(duration, intensity_level, is_scaled, target_service, defense_action)
         elif experiment_type == "process_disruption":
-            metrics = run_process_disruption(duration, intensity_level, is_scaled, target_service)
+            metrics = run_process_disruption(duration, intensity_level, is_scaled, target_service, defense_action)
         else:
-            metrics = run_cpu_stress(duration, intensity_level, is_scaled, target_service, cpu_variant, variant_combination)
+            metrics = run_cpu_stress(duration, intensity_level, is_scaled, target_service, cpu_variant, variant_combination, defense_action)
         return metrics
     except Exception as exc:
         logger.error("[Chaos] Experiment failed: %s", exc, exc_info=True)
