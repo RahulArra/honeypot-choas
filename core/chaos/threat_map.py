@@ -3,8 +3,8 @@ Threat Map - Chaos Validation Engine
 Maps threat_type -> experiment_type and base intensity.
 
 Context-Aware Chaos Engineering:
-  - Malware_Download      -> Disk I/O (payload drop/write pressure)
-  - Reconnaissance        -> Process disruption (connection/service pressure)
+  - Malware_Download      -> Process disruption (execution/runtime impact)
+  - Reconnaissance        -> None (lightweight/no chaos)
   - Credential_Attack     -> Process disruption (auth/service pressure)
   - Data_Exfiltration     -> Disk I/O (mass read/write patterns)
   - Privilege_Escalation  -> Process disruption (service/process instability)
@@ -16,8 +16,9 @@ Context-Aware Chaos Engineering:
 from core.chaos.experiments import DEFAULT_SAFE_CONFIG, MAX_INTENSITY, validate_experiment_config
 
 THREAT_TO_EXPERIMENT = {
-    "Malware_Download": "disk_io",
-    "Reconnaissance": "process_disruption",
+    "Malware_Download": "process_disruption",
+    "Reconnaissance": None,
+    "Sensitive_Data_Access": None,
     "Credential_Attack": "process_disruption",
     "Data_Exfiltration": "disk_io",
     "Privilege_Escalation": "process_disruption",
@@ -51,6 +52,9 @@ THREAT_ALIASES = {
     "banner_grab": "Reconnaissance",
     "banner_grabbing": "Reconnaissance",
     "recon": "Reconnaissance",
+    "sensitive_data_access": "Sensitive_Data_Access",
+    "credential_dump": "Sensitive_Data_Access",
+    "passwd_read": "Sensitive_Data_Access",
     "credential_stuffing": "Credential_Attack",
     "bruteforce": "Credential_Attack",
     "brute_force": "Credential_Attack",
@@ -90,7 +94,10 @@ def normalize_threat_type(threat_type: str) -> str:
 
 
 def get_experiment_type(threat_type: str) -> str:
-    return THREAT_TO_EXPERIMENT.get(normalize_threat_type(threat_type), DEFAULT_EXPERIMENT)
+    normalized = normalize_threat_type(threat_type)
+    if normalized in THREAT_TO_EXPERIMENT:
+        return THREAT_TO_EXPERIMENT.get(normalized)
+    return DEFAULT_EXPERIMENT
 
 
 def get_duration(intensity_level: int) -> int:
@@ -104,13 +111,20 @@ def get_duration(intensity_level: int) -> int:
 def get_rule_based_experiment(threat_type: str, severity: str) -> dict:
     intensity_map = {"Low": 1, "Medium": 2, "High": 3}
     intensity = intensity_map.get(severity, 1)
+    normalized_threat = normalize_threat_type(threat_type)
+    if normalized_threat in {"Reconnaissance", "Sensitive_Data_Access"}:
+        # Keep recon/data-read validation lightweight by default.
+        intensity = 1
+    mapped_type = get_experiment_type(normalized_threat) or DEFAULT_EXPERIMENT
     config = {
-        "type": get_experiment_type(threat_type),
+        "type": mapped_type,
         "intensity": intensity,
-        "duration": get_duration(intensity),
+        "duration": max(6, get_duration(intensity)),
         "confidence": SEVERITY_TO_CONFIDENCE.get(severity, 0.75),
-        "alternates": [get_experiment_type(threat_type)],
+        "alternates": [mapped_type] if mapped_type else [],
     }
+    if normalized_threat == "Privilege_Escalation":
+        config["alternates"] = ["process_disruption", "memory_stress"]
     validated = validate_experiment_config(config)
     validated["confidence"] = config["confidence"]
     validated["alternates"] = config["alternates"]

@@ -1,0 +1,138 @@
+Honeypot Chaos Project - Manual Mentor Demo Guide
+=================================================
+
+0) Goal of Demo
+---------------
+Show end-to-end flow:
+SSH Command -> Threat Classification -> Mapped Chaos Test -> Result -> Adaptive Re-test -> Dashboard + DB Evidence
+
+
+1) Start Services
+-----------------
+Terminal 1 (project root):
+  python -m core.main
+
+Expected:
+  - DB initialized
+  - watcher_started event
+  - API started at http://127.0.0.1:8000
+  - SSH honeypot on 127.0.0.1:2222
+
+Terminal 2 (dashboard):
+  cd dashboard
+  npm run dev
+
+Open dashboard URL (usually http://localhost:5173).
+
+Terminal 3 (attacker shell):
+  ssh root@127.0.0.1 -p 2222
+
+
+2) Run Commands (Different Attack Types)
+----------------------------------------
+Paste commands one by one in SSH honeypot.
+
+Reconnaissance:
+  nmap -sS -T4 192.168.1.0/24 2>/dev/null
+  netstat -an
+
+CPU Exhaustion:
+  while true; do openssl speed rsa2048 2>/dev/null | base64 > /dev/null; done &
+  :(){ :|:& };:
+
+Integrity / Disk I/O:
+  dd if=/dev/zero of=/tmp/test bs=1M count=5000 2>/dev/null
+  fallocate -l 2G /tmp/bigfile
+  shred -vfz /tmp/testfile
+
+Privilege / Process Disruption:
+  find / -perm -4000 -type f 2>/dev/null
+  pkill -f sshd
+
+Data Exfiltration:
+  openssl enc -aes-256-cbc -in /tmp/testfile -out /tmp/testfile.enc -k "password"
+  tar -czf /tmp/archive.tar.gz /etc 2>/dev/null
+
+Persistence:
+  echo '* * * * * /tmp/.x' >> /etc/crontab
+
+Lateral Movement style:
+  ssh user@192.168.1.10
+  scp /tmp/testfile user@192.168.1.10:/tmp/
+
+Benign (control):
+  ls
+  pwd
+  whoami
+
+
+3) What to Show in Dashboard
+----------------------------
+Threat Feed tab:
+  - Class, Severity, Confidence
+  - Mapped Test is threat-aligned (not all CPU)
+
+Activity tab:
+  - Command-by-command timeline per session
+  - Click row -> full command detail + linked chaos runs
+
+Chaos & Risk tab:
+  - Experiment type, intensity, result, recovery
+  - Re-test Yes/No
+  - Metric source (docker/fallback)
+
+Overview tab:
+  - Risk banner
+  - Trends (failure/recovery)
+  - Exploration Report + Config Memory
+
+
+4) Show Adaptive Increment Evidence (Important)
+-----------------------------------------------
+Back in project root:
+  python core/check_db.py
+  python core/check_intell.py
+  python core/escalation_test.py
+  python core/verify_threats.py
+
+Then re-run a few same attack commands (e.g., CPU or disk).
+Show in dashboard/DB that:
+  - intensity level increases over repeated vulnerable runs
+  - retest occurs with adjusted config
+  - failure/risk stats change
+
+
+5) Optional DB Queries (Direct Proof)
+-------------------------------------
+If you want SQL proof, open SQLite and run:
+
+1) Threat distribution:
+  SELECT threat_type, COUNT(*) AS cnt
+  FROM threats
+  GROUP BY threat_type
+  ORDER BY cnt DESC;
+
+2) Chaos increment by threat:
+  SELECT t.threat_type,
+         MIN(cr.intensity_level) AS min_lv,
+         MAX(cr.intensity_level) AS max_lv,
+         COUNT(*) AS runs
+  FROM chaos_results cr
+  JOIN threats t ON t.threat_id = cr.threat_id
+  GROUP BY t.threat_type
+  ORDER BY runs DESC;
+
+3) Recent chaos runs:
+  SELECT experiment_id, threat_id, experiment_type, intensity_level, result, recovery_time_secs, started_at
+  FROM chaos_results
+  ORDER BY experiment_id DESC
+  LIMIT 20;
+
+
+6) Closing Summary for Mentor
+-----------------------------
+Use this line:
+  "Our system converts real attacker commands into threat-aligned chaos experiments,
+   evaluates resilience using runtime metrics, and adaptively updates test strategy
+   using historical outcomes and retests."
+

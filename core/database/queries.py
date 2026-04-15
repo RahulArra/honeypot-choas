@@ -153,3 +153,53 @@ def get_threat_prediction(threat_type):
             "risk_score": round(float(row[3] or 0.0), 2),
         }
     return {"total_runs": 0, "total_failures": 0, "failure_rate": 0.0, "risk_score": 0.0}
+
+
+def insert_adaptive_defense_run(
+    threat_type: str,
+    experiment_type: str,
+    intensity_level: int,
+    duration_secs: int,
+    variant: str,
+    defense_action: str,
+    recovery_time_secs: float,
+    result: str,
+    score: float,
+):
+    safe_execute(
+        """
+        INSERT INTO adaptive_defense_runs (
+            threat_type, experiment_type, intensity_level, duration_secs, variant,
+            defense_action, recovery_time_secs, result, score
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            str(threat_type or "Unknown"),
+            str(experiment_type or "cpu_stress"),
+            int(intensity_level or 1),
+            int(duration_secs or 5),
+            str(variant or ""),
+            str(defense_action or "no_action"),
+            float(recovery_time_secs or 0.0),
+            str(result or "Resilient"),
+            float(score or 0.0),
+        ),
+    )
+
+
+def get_defense_action_avg_scores(threat_type: str):
+    rows = safe_execute(
+        """
+        SELECT defense_action, AVG(score) as avg_score, COUNT(*) as runs
+        FROM adaptive_defense_runs
+        WHERE threat_type = ?
+        GROUP BY defense_action
+        """,
+        (threat_type,),
+        fetch=True,
+    )
+    result = {}
+    for action, avg_score, runs in (rows or []):
+        result[str(action)] = {"avg_score": float(avg_score or 0.0), "runs": int(runs or 0)}
+    return result
